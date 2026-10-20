@@ -1,0 +1,22 @@
+{
+  "name": "pi-peers",
+  "version": "0.1.0",
+  "description": "Cross-session messaging between pi-compatible coding agent instances on one machine (registry + named pipe/UDS + token auth + receipts). Works as an extension on pi and oh-my-pi.",
+  "type": "module",
+  "private": true,
+  "pi": { "extensions": ["./src/index.ts"] },
+  "omp": { "extensions": ["./src/index.ts"] },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typebox": "^1.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
