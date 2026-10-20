@@ -192,7 +192,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		acceptPolicy: (): PeerAcceptPolicy => {
 			const override = process.env[ENV_PEERS_ACCEPT];
 			if (override === "ask" || override === "all" || override === "off") return override;
-			return ctx?.hasUI ? "ask" : "off";
+			// Default is open: key files are 0600 (same-user only), and a same-user
+			// process can already do anything the agent could be told to do. The
+			// feature exists for frictionless window-to-window messaging.
+			return "all";
 		},
 	};
 

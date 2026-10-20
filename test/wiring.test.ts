@@ -222,7 +222,8 @@ describe("peers plugin wiring (dual-host)", () => {
 	});
 
 	it("delivers inbound messages bare when idle, with deliverAs when busy", async () => {
-		process.env.PI_PEERS_ACCEPT = "all";
+		// No PI_PEERS_ACCEPT override: the default policy is "all" (open by design),
+		// even though this fake ctx has no UI.
 		const { pi, handlers, sent } = createFakePi();
 		peersExtension(pi);
 

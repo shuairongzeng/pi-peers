@@ -94,7 +94,7 @@ flowchart LR
 
 | Variable | Meaning |
 | --- | --- |
-| `PI_PEERS_ACCEPT` | Inbound accept policy: `ask` (prompt the user), `all` (accept silently), `off` (refuse). Default: `ask` when a dialog-capable UI is available, else `off`. |
+| `PI_PEERS_ACCEPT` | Inbound accept policy: `all` (accept silently — **the default**), `ask` (prompt the user), `off` (refuse). Peer messages are authenticated by a 0600 same-user token, so open-by-default is safe on a single-user machine; set `ask` on shared machines or while evaluating untrusted peers. |
 | `PI_PEERS_DISABLED` | `1`/`true`/`yes` disables the extension entirely — no tool, no command, no listener. |
 | `PI_PEERS_DIR` | Override the shared registry directory (default `~/.pi-peers`). All hosts read the same dir, so pi and oh-my-pi instances see each other. |
 | `PI_PEERS_SOCKET` / `PI_PEERS_TOKEN` | Parent→child handoff for spawned subagents. Read-only for users. |
