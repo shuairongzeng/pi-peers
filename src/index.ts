@@ -153,7 +153,16 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	const host: PeerHost = {
 		injectUserMessage: async (content, priority) => {
-			pi.sendUserMessage(content, { deliverAs: priority === "now" ? "steer" : "followUp" });
+			// Host divergence: pi always goes through prompt() (idle starts a turn,
+			// deliverAs only steers streaming queuing); oh-my-pi queues deliverAs
+			// "steer"/"followUp" WITHOUT ever starting a turn on an idle session.
+			// Omitting deliverAs reaches prompt() on both — so when idle, omit it;
+			// when busy, pass the queue semantic through.
+			if (ctx?.isIdle()) {
+				pi.sendUserMessage(content);
+			} else {
+				pi.sendUserMessage(content, { deliverAs: priority === "now" ? "steer" : "followUp" });
+			}
 		},
 		notify: (title, message) => {
 			if (ctx?.hasUI) ctx.ui.notify(`${title}: ${message}`, "info");
@@ -173,7 +182,11 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			}
 		},
 		injectAgentNotice: async (text) => {
-			pi.sendUserMessage(text, { deliverAs: "followUp" });
+			if (ctx?.isIdle()) {
+				pi.sendUserMessage(text);
+			} else {
+				pi.sendUserMessage(text, { deliverAs: "followUp" });
+			}
 		},
 		hasUI: () => ctx?.hasUI ?? false,
 		acceptPolicy: (): PeerAcceptPolicy => {

@@ -11,10 +11,12 @@
  * the peers record is read back from disk after each transition.
  */
 
+import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import peersExtension from "../src/index.ts";
 import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE, type PeersExtensionContext, type PeersHostAPI } from "../src/types.ts";
 
@@ -29,6 +31,7 @@ function createFakePi() {
 	const handlers = new Map<string, Handler>();
 	const tools: RegisteredTool[] = [];
 	const commands = new Map<string, unknown>();
+	const sent: { text: string; options?: { deliverAs?: string } }[] = [];
 	const pi = {
 		registerTool(tool: RegisteredTool) {
 			tools.push(tool);
@@ -40,9 +43,11 @@ function createFakePi() {
 			handlers.set(event, handler);
 			return () => handlers.delete(event);
 		},
-		sendUserMessage() {},
+		sendUserMessage(text: string, options?: { deliverAs?: string }) {
+			sent.push({ text, options });
+		},
 	};
-	return { pi: pi as unknown as PeersHostAPI, handlers, tools, commands };
+	return { pi: pi as unknown as PeersHostAPI, handlers, tools, commands, sent };
 }
 
 function createFakeCtx(cwd: string, overrides: Partial<PeersExtensionContext> = {}): PeersExtensionContext {
@@ -214,6 +219,59 @@ describe("peers plugin wiring (dual-host)", () => {
 		// omp plain agent_end (no flags) → idle.
 		await handlers.get("agent_end")?.({ type: "agent_end", messages: [] }, ctx);
 		expect(readOwnRecord().status).toBe("idle");
+	});
+
+	it("delivers inbound messages bare when idle, with deliverAs when busy", async () => {
+		process.env.PI_PEERS_ACCEPT = "all";
+		const { pi, handlers, sent } = createFakePi();
+		peersExtension(pi);
+
+		let idle = true;
+		const ctx = createFakeCtx(peersDir, { isIdle: () => idle });
+		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+
+		// Deliver a real frame over the wire, as a peer would.
+		const record = readOwnRecord();
+		const socketPath = record.socketPath as string;
+		const keyName = readdirSync(peersDir).find((f) => PEER_KEY_FILE_RE.test(f));
+		const key = JSON.parse(readFileSync(join(peersDir, keyName!), "utf8")) as { peerToken: string };
+
+		const deliver = (text: string): Promise<void> => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			const sock = createConnection(socketPath, () => {
+				sock.write(`${JSON.stringify({ type: "auth", token: key.peerToken })}\n`);
+				sock.write(
+					`${JSON.stringify({
+						msgV: 1,
+						msg_id: randomUUID(),
+						type: "user",
+						from: "pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc",
+						fromPid: 4242,
+						fromSession: "sess-test",
+						fromName: "test-peer",
+						hopChain: ["pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc"],
+						content: `<cross-session-message from="pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc">${text}</cross-session-message>`,
+						priority: "next",
+					})}\n`,
+				);
+				sock.end(() => resolve());
+			});
+			sock.on("error", reject);
+			return promise;
+		};
+
+		await deliver("first message");
+		await vi.waitFor(() => expect(sent).toHaveLength(1));
+		// Idle: no deliverAs — pi reaches prompt(), omp reaches prompt(); both start a turn.
+		expect(sent[0]!.options).toBeUndefined();
+
+		idle = false;
+		await deliver("second message");
+		await vi.waitFor(() => expect(sent).toHaveLength(2));
+		// Busy: followUp queues behind the running turn on both hosts.
+		expect(sent[1]!.options).toEqual({ deliverAs: "followUp" });
+
+		await handlers.get("session_shutdown")?.({ type: "session_shutdown", reason: "quit" }, ctx);
 	});
 
 	it("does nothing when PI_PEERS_DISABLED is set", () => {

@@ -49,6 +49,7 @@ Run `npm install` once after cloning; the hosts load TypeScript directly and nee
 ## Known host differences
 
 - **oh-my-pi has no `session_info_changed`**: renames are not broadcast to other peers. A renamed oh-my-pi session republishes its (derived) name on the next `session_start`; until then, peers see the old name.
+- **Idle delivery**: oh-my-pi's `sendUserMessage` with `deliverAs` only queues — it never starts a turn on an idle session; pi always routes through `prompt()`. The plugin therefore omits `deliverAs` when the receiving session is idle (both hosts then start a turn immediately) and passes `steer`/`followUp` only when the session is busy.
 - **Shutdown budget**: hosts give `session_shutdown` handlers roughly 2 seconds before continuing; registry unpublish and key deletion are best-effort synchronous, so this is normally ample, but a hung close could be cut off.
 
 ## Development
