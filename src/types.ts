@@ -194,6 +194,12 @@ export interface PeerRecord {
 	pid: number;
 	sessionId: string;
 	cwd: string;
+	/**
+	 * Project identity for scoping: git repo root when the cwd is inside a git
+	 * work tree, else the cwd itself. Optional for forward compat with records
+	 * written by older plugin versions (treat missing as `cwd`).
+	 */
+	projectRoot?: string;
 	name: string;
 	nameSource: PeerNameSource;
 	formerNames: PeerFormerName[];
@@ -211,6 +217,31 @@ export interface PeerRecord {
 	socketPath: string;
 	peerProtocol: number;
 	features: string[];
+}
+
+/**
+ * Normalize a filesystem path for comparison: backslashes to slashes, strip
+ * trailing separators (keeping a bare drive root like `C:/`), case-fold on
+ * Windows. Inputs are host-provided cwd/git-root values, already absolute.
+ */
+export function normalizeFsPath(p: string, windows: boolean): string {
+	let out = p.replace(/\\/g, "/");
+	while (out.length > 3 && out.endsWith("/")) out = out.slice(0, -1);
+	return windows ? out.toLowerCase() : out;
+}
+
+/** Project identity of a record: git repo root when present, else cwd. */
+export function projectRootOf(record: PeerRecord): string {
+	return record.projectRoot ?? record.cwd;
+}
+
+/**
+ * True when two records belong to the same project. Path comparison is
+ * case-insensitive when either side reports a Windows pidDomain.
+ */
+export function sameProject(a: PeerRecord, b: PeerRecord): boolean {
+	const windows = a.pidDomain.startsWith("win32:") || b.pidDomain.startsWith("win32:");
+	return normalizeFsPath(projectRootOf(a), windows) === normalizeFsPath(projectRootOf(b), windows);
 }
 
 // ---------------------------------------------------------------------------
@@ -453,6 +484,8 @@ export interface PeerRegistry {
 	list(): PeerRegistryEntry[];
 	/** Resolve a user/agent-supplied name ("name", "name [ref]", or exact sessionId) to one live peer. */
 	resolve(name: string): PeerResolution;
+	/** Like resolve(), but matches only within the given candidate list (e.g. project-scoped). */
+	resolveIn(name: string, entries: PeerRegistryEntry[]): PeerResolution;
 	/** Normalize a display name for comparison (NFKC, lowercased, spaces→dashes). */
 	normalizeName(name: string): string;
 	/** Short disambiguation ref for a record (first 6 hex of sha256(canonical socketPath)). */

@@ -66,6 +66,11 @@ Tool reference (what the model sees):
 | `send_peer_message { action: "send", to, message }` | Deliver `message` to the peer's agent. `to` accepts a name (`"alice"`), a disambiguated name (`"alice [ab12cd]"`), or a wire address copied from an incoming message. |
 | `… { priority: "now" }` | Interrupt the peer's current work immediately instead of queueing behind it. |
 | `… { notifyWhenIdle: true }` | One-shot ping back to you when the peer next goes idle. |
+| `… { scope: "all" }` | Reach sessions in **other projects** (see below). |
+
+### Project scope
+
+Peers are scoped by project: a session's project is its git repository root (or its working directory outside a work tree). By default, `list` and `send` only see sessions in **your** project — windows in other repositories are invisible and unreachable, so an agent can never accidentally task a window from an unrelated project. `/peers` shows your project's sessions and summarizes the rest as `(+N sessions in other projects …)`. To deliberately reach across projects, pass `scope: "all"` to the tool.
 
 Inbound messages arrive as user-role text wrapped in `<cross-session-message from="ADDRESS" from-name="NAME">…</cross-session-message>`, and the agent is instructed (via a system-prompt section the plugin injects) to reply by copying `from` into `to`. A send returns once the message reaches the peer's queue; an asynchronous receipt (`delivered` / `held` / `denied` / `refused` / `dropped`) follows into your session.
 

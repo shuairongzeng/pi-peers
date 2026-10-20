@@ -11,14 +11,16 @@
  * the peers record is read back from disk after each transition.
  */
 
+import { execFile, type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import peersExtension from "../src/index.ts";
-import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE, type PeersExtensionContext, type PeersHostAPI } from "../src/types.ts";
+import peersExtension, { computeProjectRoot } from "../src/index.ts";
+import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE, type PeersExtensionContext, type PeersHostAPI, type PeerRecord } from "../src/types.ts";
 
 interface RegisteredTool {
 	name: string;
@@ -97,6 +99,53 @@ describe("peers plugin wiring (dual-host)", () => {
 	function readOwnRecord(): Record<string, unknown> {
 		const path = join(peersDir, `${process.pid}.json`);
 		return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	}
+
+	/** git's own answer for the work-tree root of `cwd`; undefined when git is missing/fails. */
+	async function gitToplevel(cwd: string): Promise<string | undefined> {
+		try {
+			const { stdout } = await promisify(execFile)("git", ["-C", cwd, "rev-parse", "--show-toplevel"]);
+			const out = stdout.trim();
+			return out !== "" ? out : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
+	/** True when `git init` works here (skips git-dependent sub-assertions). */
+	async function gitWorks(): Promise<boolean> {
+		const probe = mkdtempSync(join(tmpdir(), "pi-peers-gitprobe-"));
+		try {
+			await promisify(execFile)("git", ["init", "--quiet", probe]);
+			return true;
+		} catch {
+			return false;
+		} finally {
+			rmSync(probe, { recursive: true, force: true });
+		}
+	}
+
+	/** Minimal record the real registry's parser accepts. */
+	function peerRecord(pid: number, overrides: Partial<PeerRecord> = {}): PeerRecord {
+		return {
+			version: 1,
+			pid,
+			sessionId: `sess-${pid}`,
+			cwd: peersDir,
+			projectRoot: peersDir,
+			name: `p-${pid}`,
+			nameSource: "derived",
+			formerNames: [],
+			kind: "interactive",
+			status: "idle",
+			statusUpdatedAt: Date.now(),
+			startedAt: Date.now(),
+			pidDomain: "win32:box",
+			socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${pid.toString(16).padStart(32, "0")}`,
+			peerProtocol: 1,
+			features: ["notify_idle"],
+			...overrides,
+		};
 	}
 
 	it("registers the tool and command, publishes a record on session_start, sweeps stale records, cleans up on quit", async () => {
@@ -302,5 +351,135 @@ describe("peers plugin wiring (dual-host)", () => {
 		const ctx = createFakeCtx(peersDir);
 		await registered.handler?.("", ctx);
 		await registered("", ctx);
+	});
+
+	it("publishes a record with projectRoot: git root inside a work tree, ctx.cwd outside", async () => {
+		const { pi, handlers } = createFakePi();
+		peersExtension(pi);
+
+		// Outside any git work tree (fresh mkdtemp under the OS tmpdir):
+		// projectRoot === ctx.cwd.
+		const outside = mkdtempSync(join(tmpdir(), "pi-peers-outside-"));
+		try {
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, createFakeCtx(outside));
+			const r = readOwnRecord();
+			expect(r.cwd).toBe(outside);
+			expect(r.projectRoot).toBe(outside);
+		} finally {
+			rmSync(outside, { recursive: true, force: true });
+		}
+
+		// Inside a git work tree (skipped when git is unavailable here):
+		// projectRoot === git's own toplevel answer.
+		if (!(await gitWorks())) return;
+		const repo = mkdtempSync(join(tmpdir(), "pi-peers-repo-"));
+		try {
+			await promisify(execFile)("git", ["init", "--quiet", repo]);
+			// A second session_start republishes with the new project's root.
+			await handlers.get("session_start")?.({ type: "session_start", reason: "new" }, createFakeCtx(repo));
+			const r2 = readOwnRecord();
+			expect(r2.cwd).toBe(repo);
+			expect(r2.projectRoot).toBe(await gitToplevel(repo));
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("computeProjectRoot: cwd fallback outside a repo, git toplevel inside one", async () => {
+		const outside = mkdtempSync(join(tmpdir(), "pi-peers-outside-"));
+		try {
+			// Not a repo (and even a failing/missing git must resolve, not reject).
+			expect(await computeProjectRoot(outside)).toBe(outside);
+		} finally {
+			rmSync(outside, { recursive: true, force: true });
+		}
+
+		if (!(await gitWorks())) return;
+		const repo = mkdtempSync(join(tmpdir(), "pi-peers-repo-"));
+		try {
+			await promisify(execFile)("git", ["init", "--quiet", repo]);
+			// A nested cwd still resolves to the work-tree root.
+			const nested = join(repo, "sub", "dir");
+			mkdirSync(nested, { recursive: true });
+			expect(await computeProjectRoot(nested)).toBe(await gitToplevel(nested));
+		} finally {
+			rmSync(repo, { recursive: true, force: true });
+		}
+	});
+
+	it("computeProjectRoot falls back to the cwd when git is unavailable (ENOENT)", async () => {
+		// Empty PATH (plus a bogus COMSPEC so Windows' execvp-style lookup
+		// cannot fall back to the system dir) makes git unspawnable.
+		const savedPath = process.env.PATH;
+		const savedComSpec = process.env.COMSPEC;
+		const cwd = mkdtempSync(join(tmpdir(), "pi-peers-nogit-"));
+		process.env.PATH = "";
+		process.env.COMSPEC = "definitely-not-a-real-shell";
+		try {
+			await expect(computeProjectRoot(cwd)).resolves.toBe(cwd);
+		} finally {
+			process.env.PATH = savedPath;
+			if (savedComSpec === undefined) delete process.env.COMSPEC;
+			else process.env.COMSPEC = savedComSpec;
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("/peers lists same-project sessions line by line and only summarizes other projects", async () => {
+		const { pi, handlers, commands } = createFakePi();
+		peersExtension(pi);
+
+		const ctx = createFakeCtx(peersDir);
+		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+
+		// Two real live child processes: one in another project, one in ours.
+		// (Liveness is a real kill(pid, 0) probe — records must point at
+		// processes that actually exist, so plant records under their pids.)
+		const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000);"], { stdio: "ignore", windowsHide: true });
+		const same = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000);"], { stdio: "ignore", windowsHide: true });
+		const otherPid = other.pid as number;
+		const samePid = same.pid as number;
+		try {
+			const exitPromises = [other, same].map((child) => {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				child.once("exit", () => resolve());
+				return promise;
+			});
+			writeFileSync(
+				join(peersDir, `${otherPid}.json`),
+				JSON.stringify(
+					peerRecord(otherPid, { name: "elsewhere", cwd: "D:/nowhere/other-project", projectRoot: "D:/nowhere/other-project" }),
+				),
+			);
+			writeFileSync(
+				join(peersDir, `${samePid}.json`),
+				JSON.stringify(peerRecord(samePid, { name: "here", cwd: peersDir, projectRoot: peersDir })),
+			);
+
+			const messages: string[] = [];
+			const notifyCtx = createFakeCtx(peersDir, {
+				ui: { notify: (m: string) => messages.push(m), confirm: async () => true },
+			});
+			const registered = commands.get("peers") as unknown as {
+				(args: string, ctx: PeersExtensionContext): Promise<void>;
+			};
+			await registered("", notifyCtx);
+
+			const text = messages.join("\n");
+			// Same-project sessions are listed line by line, self included.
+			expect(text).toContain("here");
+			expect(text).toContain("(this session)");
+			// Other-project sessions collapse into one summary line.
+			expect(text).toContain('(+1 sessions in other projects — use the send_peer_message tool with scope: "all" to reach them)');
+			expect(text).not.toContain("elsewhere");
+			expect(text).not.toContain("other-project");
+
+			other.kill();
+			same.kill();
+			await Promise.all(exitPromises);
+		} finally {
+			other.kill();
+			same.kill();
+		}
 	});
 });

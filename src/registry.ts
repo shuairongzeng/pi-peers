@@ -321,6 +321,10 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 	}
 
 	function resolve(name: string): PeerResolution {
+		return resolveIn(name, list());
+	}
+
+	function resolveIn(name: string, entries: PeerRegistryEntry[]): PeerResolution {
 		const input = name.trim();
 		if (input === "") {
 			return { kind: "none" };
@@ -336,7 +340,7 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		}
 
 		// Only live peers are resolvable targets; dead entries are reported by list() for cleanup.
-		const candidates = list()
+		const candidates = entries
 			.filter((entry) => entry.live)
 			.filter((entry) => ref === undefined || refOf(entry.record) === ref);
 
@@ -384,6 +388,7 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		unpublish,
 		list,
 		resolve,
+		resolveIn,
 		normalizeName,
 		refOf,
 		isAlive,

@@ -201,6 +201,7 @@ function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: Pe
 		unpublish: () => {},
 		list: () => entries,
 		resolve: resolveImpl,
+		resolveIn: (name: string, scoped: PeerRegistryEntry[]) => resolveImpl(name),
 		normalizeName: (name: string) => name.toLowerCase().replace(/\s+/g, "-"),
 		refOf: (rec: PeerRecord) => `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`,
 		isAlive: () => true,

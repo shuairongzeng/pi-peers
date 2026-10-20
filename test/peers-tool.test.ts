@@ -4,6 +4,7 @@ import type {
 	PeerOutbox,
 	PeerRecord,
 	PeerRegistry,
+	PeerRegistryEntry,
 	PeerToolDeps,
 	PeersCommandContext,
 	PeersToolDefinition,
@@ -35,6 +36,15 @@ function record(overrides: Partial<PeerRecord> = {}): PeerRecord {
 		...overrides,
 	};
 }
+function resolveInImpl(
+	name: string,
+	entries: Array<{ record: PeerRecord; live: boolean }>,
+): { kind: "unique" | "ambiguous" | "none"; entry?: unknown; candidates?: unknown[] } {
+	const matches = entries.filter(({ record }) => record.name === name);
+	if (matches.length === 0) return { kind: "none" };
+	if (matches.length > 1) return { kind: "ambiguous", candidates: matches };
+	return { kind: "unique", entry: matches[0] };
+}
 
 function makeRegistry(entries: PeerRecord[]): PeerRegistry {
 	const list = entries.map((rec) => ({ record: rec, live: true }));
@@ -43,13 +53,8 @@ function makeRegistry(entries: PeerRecord[]): PeerRegistry {
 		update: () => {},
 		unpublish: () => {},
 		list: () => list,
-		resolve: (name: string) => {
-			const matches = list.filter(({ record }) => record.name === name);
-			if (matches.length === 0) return { kind: "none" };
-			if (matches.length > 1) return { kind: "ambiguous", candidates: matches };
-			return { kind: "unique", entry: matches[0] };
-		},
-		normalizeName: (name: string) => name.toLowerCase().replace(/\s+/g, "-"),
+		resolve: (name: string) => resolveInImpl(name, list),
+		resolveIn: (name: string, scoped: PeerRegistryEntry[]) => resolveInImpl(name, scoped),
 		refOf: (rec: PeerRecord) => `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`,
 		isAlive: () => true,
 		readProcStart: () => undefined,
@@ -89,8 +94,8 @@ function fakeDeps(opts: { outbox: PeerOutbox; entries?: PeerRecord[]; ownPid?: n
 	return { outbox: opts.outbox, registry, identity: fakeIdentity(ownPid) };
 }
 
-async function runTool(tool: PeersToolDefinition, params: Record<string, unknown>) {
-	const ctx = {} as Parameters<PeersToolDefinition["execute"]>[4];
+async function runTool(tool: PeersToolDefinition, params: Record<string, unknown>, cwd = "D:/work/alpha") {
+	const ctx = { cwd } as Parameters<PeersToolDefinition["execute"]>[4];
 	return tool.execute("call-1", params as never, undefined, undefined, ctx);
 }
 
@@ -179,6 +184,121 @@ describe("createPeerMessageTool", () => {
 		expect(sends).toBe(0);
 		expect(result.isError).toBe(true);
 		expect(textOf(result)).toContain('action: "list"');
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Tool: project scoping
+// ---------------------------------------------------------------------------
+
+describe("createPeerMessageTool project scoping", () => {
+	const selfRecord = record({
+		pid: 100,
+		name: "me",
+		cwd: "D:/work/alpha",
+		projectRoot: "D:/work/alpha",
+		sessionId: "1000000000000000",
+	});
+	const sameProjectPeer = record({
+		pid: 200,
+		name: "alpha",
+		cwd: "D:/work/alpha/sub",
+		projectRoot: "D:/work/alpha",
+		sessionId: "2000000000000000",
+	});
+	const otherProjectPeer = record({
+		pid: 300,
+		name: "beta",
+		cwd: "D:/work/beta",
+		projectRoot: "D:/work/beta",
+		sessionId: "3000000000000000",
+	});
+	const entries = [selfRecord, sameProjectPeer, otherProjectPeer];
+
+	it("list defaults to the same project and hides other projects with a summary line", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha"));
+		expect(text).toContain("me");
+		expect(text).toContain("alpha");
+		expect(text).not.toContain("beta");
+		expect(text).toContain('(+1 sessions in other projects hidden; pass scope: "all" to include)');
+	});
+
+	it("list with scope:all lists every live session", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const text = textOf(await runTool(tool, { action: "list", scope: "all" }, "D:/work/alpha"));
+		expect(text).toContain("me");
+		expect(text).toContain("alpha");
+		expect(text).toContain("beta");
+		expect(text).not.toContain("other projects hidden");
+	});
+
+	it("send to another project is refused by default and names the target project root", async () => {
+		let sends = 0;
+		const outbox = makeOutbox(async () => {
+			sends++;
+			return { msgId: "m-1", to: "x" };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const result = await runTool(tool, { to: "beta", message: "hi" }, "D:/work/alpha");
+		expect(sends).toBe(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("another project");
+		expect(text).toContain("D:/work/beta");
+		expect(text).toContain('scope: "all"');
+	});
+
+	it("send with scope:all reaches the other-project peer", async () => {
+		const calls: Array<[string, string, { priority?: string; notifyWhenIdle?: boolean }]> = [];
+		const outbox = makeOutbox(async (target, body, opts) => {
+			calls.push([target, body, opts]);
+			return { msgId: "m-9", to: "pipe:LOCAL\\pi-peer-eee", toName: "beta" };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const result = await runTool(tool, { to: "beta", message: "hi", scope: "all" }, "D:/work/alpha");
+		expect(result.isError).toBeUndefined();
+		expect(calls).toEqual([["beta", "hi", { priority: undefined, notifyWhenIdle: undefined }]]);
+		expect(textOf(result)).toContain('"beta"');
+	});
+
+	it("send within the same project is untouched by the scope gate", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-3", to: "pipe:LOCAL\\pi-peer-ccc", toName: "alpha" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const result = await runTool(tool, { to: "alpha", message: "hi" }, "D:/work/alpha");
+		expect(result.isError).toBeUndefined();
+		expect(textOf(result)).toContain('"alpha"');
+	});
+
+	it("scopes by ctx.cwd when this session is not registered", async () => {
+		// No self record in the registry: the fallback path compares the
+		// context cwd (normalized) against each candidate's project root.
+		const unregistered = [sameProjectPeer, otherProjectPeer];
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: unregistered, ownPid: 999 }));
+		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha/"));
+		expect(text).toContain("alpha");
+		expect(text).not.toContain("beta");
+		expect(text).toContain('(+1 sessions in other projects hidden; pass scope: "all" to include)');
+
+		const sendResult = await runTool(tool, { to: "beta", message: "hi" }, "D:/work/alpha/");
+		expect(sendResult.isError).toBe(true);
+		expect(textOf(sendResult)).toContain("D:/work/beta");
+	});
+
+	it("send to a name that exists nowhere still falls through to the outbox", async () => {
+		let sends = 0;
+		const outbox = makeOutbox(async () => {
+			sends++;
+			throw new PeerSendError("not_found", "ghost");
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries, ownPid: 100 }));
+		const result = await runTool(tool, { to: "ghost", message: "hi" }, "D:/work/alpha");
+		expect(sends).toBe(1);
+		expect(result.isError).toBe(true);
+		expect(textOf(result)).toContain("No live peer matches");
 	});
 });
 
