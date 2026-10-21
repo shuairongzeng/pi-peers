@@ -40,6 +40,7 @@ interface ScriptedHost extends PeerHost {
 	injectError: Error | undefined;
 	hasUIValue: boolean;
 	policy: "ask" | "all" | "off";
+	idleNowValue: boolean;
 }
 
 function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
@@ -52,6 +53,7 @@ function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
 		injectError: undefined,
 		hasUIValue: true,
 		policy: "ask",
+		idleNowValue: false,
 		...overrides,
 		async injectUserMessage(content, priority) {
 			if (this.injectError) throw this.injectError;
@@ -72,6 +74,9 @@ function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
 		},
 		acceptPolicy() {
 			return this.policy;
+		},
+		isIdleNow() {
+			return this.idleNowValue;
 		},
 	};
 }
@@ -968,6 +973,63 @@ describe("createPeerInbox", () => {
 		// One-shot: a second idle transition sends nothing.
 		inbox.onIdle();
 		expect(outbox.controlCalls.length).toBe(1);
+	});
+
+	it("notify_when_idle while already idle replies immediately and parks no subscription", async () => {
+		const replyTo = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const transport = makeTransport();
+		transport.validAddresses.add(replyTo);
+		const { inbox, outbox } = makeInbox({ transport, host: { idleNowValue: true } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "sub-immediate",
+			type: "control",
+			action: "notify_when_idle",
+			reply_to: replyTo,
+			from: replyTo,
+			fromName: "alpha",
+			nonce: "n-imm",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(outbox.controlCalls.length).toBe(1);
+		const { address, frame: notice } = outbox.controlCalls[0]!;
+		const idleNotice = notice as PeerIdleNoticeFrame;
+		expect(address).toBe(replyTo);
+		expect(idleNotice.action).toBe("peer_idle_notice");
+		expect(idleNotice.from).toBe(`pipe:LOCAL\\pi-peer-${"f".repeat(32)}`);
+		expect(idleNotice.fromName).toBe("me");
+		expect(idleNotice.nonce).toBe("n-imm");
+		// No residue: a later busy→idle transition must not send a second notice.
+		inbox.onIdle();
+		expect(outbox.controlCalls.length).toBe(1);
+	});
+
+	it("notify_when_idle while busy defers the notice to the next onIdle", async () => {
+		const replyTo = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const transport = makeTransport();
+		transport.validAddresses.add(replyTo);
+		const { inbox, outbox } = makeInbox({ transport, host: { idleNowValue: false } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "sub-busy",
+			type: "control",
+			action: "notify_when_idle",
+			reply_to: replyTo,
+			from: replyTo,
+			fromName: "beta",
+			nonce: "n-busy",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+		expect(outbox.controlCalls).toEqual([]);
+
+		inbox.onIdle();
+		expect(outbox.controlCalls.length).toBe(1);
+		const idleNotice = outbox.controlCalls[0]!.frame as PeerIdleNoticeFrame;
+		expect(idleNotice.action).toBe("peer_idle_notice");
+		expect(idleNotice.nonce).toBe("n-busy");
 	});
 
 	it("notify_when_idle with an invalid address is rejected", async () => {

@@ -219,6 +219,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			}
 		},
 		hasUI: () => ctx?.hasUI ?? false,
+		isIdleNow: () => ctx?.isIdle() ?? false,
 		acceptPolicy: (): PeerAcceptPolicy => {
 			const override = process.env[ENV_PEERS_ACCEPT];
 			if (override === "ask" || override === "all" || override === "off") return override;
@@ -296,6 +297,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			startedAt: Date.now(),
 			procStart: registry.readProcStart(process.pid),
 			pidDomain: registry.pidDomain(),
+			contextUsage: ctx.getContextUsage?.(),
 			socketPath: socketAddress.path,
 			peerProtocol: PEER_PROTOCOL_VERSION,
 			features: [...PEER_FEATURES],
@@ -307,8 +309,13 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	const setStatus = (status: "busy" | "idle"): void => {
 		if (record === undefined) return;
-		record = { ...record, status, statusUpdatedAt: Date.now() };
-		registry.update(process.pid, { status, statusUpdatedAt: record.statusUpdatedAt });
+		const usage = ctx?.getContextUsage?.();
+		record = { ...record, status, statusUpdatedAt: Date.now(), ...(usage !== undefined ? { contextUsage: usage } : {}) };
+		registry.update(process.pid, {
+			status,
+			statusUpdatedAt: record.statusUpdatedAt,
+			...(usage !== undefined ? { contextUsage: usage } : {}),
+		});
 	};
 
 	pi.registerTool(createPeerMessageTool({ outbox, registry, identity }));
@@ -325,8 +332,11 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	// (the same line format the tool's "list" action prints); other-project
 	// sessions collapse into a summary line, since reaching them requires an
 	// explicit scope:"all" send.
-	const peerLine = (rec: PeerRecord, self: boolean): string =>
-		`${rec.name} [${registry.refOf(rec)}]  ${rec.status}  ${rec.kind}  ${rec.cwd}  (${rec.sessionId.slice(0, 8)})${self ? "  (this session)" : ""}`;
+	const peerLine = (rec: PeerRecord, self: boolean): string => {
+		const pct = rec.contextUsage?.percent;
+		const usage = typeof pct === "number" ? `  ctx ${Math.round(pct)}%` : "";
+		return `${rec.name} [${registry.refOf(rec)}]  ${rec.status}${usage}  ${rec.kind}  ${rec.cwd}  (${rec.sessionId.slice(0, 8)})${self ? "  (this session)" : ""}`;
+	};
 
 	const command = createPeersCommand({ outbox, registry, identity });
 	const commandHandler = Object.assign(
@@ -375,27 +385,44 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx = eventCtx;
 		if (server === undefined) {
-			server = await transport.listen(socketAddress, (conn, firstLine, lines) => {
-				void acceptConnection(conn, firstLine, lines);
-			});
-			auth.publishKey(
-				peersDir,
-				process.pid,
-				socketAddress.path,
-				tokens,
-				registry.readProcStart(process.pid),
-				registry.pidDomain(),
-			);
-			// Hand our coordinates to spawned child processes (subagents); they
-			// authenticate back to us with the child token.
-			process.env[ENV_PEERS_SOCKET] = identity.socketAddress;
-			process.env[ENV_PEERS_TOKEN] = tokens.childToken;
+			try {
+				server = await transport.listen(socketAddress, (conn, firstLine, lines) => {
+					void acceptConnection(conn, firstLine, lines);
+				});
+				auth.publishKey(
+					peersDir,
+					process.pid,
+					socketAddress.path,
+					tokens,
+					registry.readProcStart(process.pid),
+					registry.pidDomain(),
+				);
+				// Hand our coordinates to spawned child processes (subagents); they
+				// authenticate back to us with the child token.
+				process.env[ENV_PEERS_SOCKET] = identity.socketAddress;
+				process.env[ENV_PEERS_TOKEN] = tokens.childToken;
+			} catch (err) {
+				// Receive-side setup failed (stale socket file, dir perms): degrade
+				// to send-only instead of failing the whole session start. The record
+				// still publishes so other sessions see us; senders get a connect
+				// error which surfaces as the normal "offline" outcome.
+				eventCtx.ui.notify(
+					`peers: failed to start the listener — this session can send but not receive (${err instanceof Error ? err.message : String(err)})`,
+					"warning",
+				);
+			}
 		}
 		// Project scoping: resolve the git work-tree root here (async) so the
 		// sync publishRecord() below can stamp it into the record; computed
 		// once per session_start and cached for every republish.
 		projectRoot = await computeProjectRoot(eventCtx.cwd);
-		publishRecord();
+		try {
+			publishRecord();
+		} catch (err) {
+			// Broken registry dir (e.g. PI_PEERS_DIR points at a file): the session
+			// stays fully usable locally, just invisible to peers.
+			eventCtx.ui.notify(`peers: failed to publish the session record (${err instanceof Error ? err.message : String(err)})`, "warning");
+		}
 	});
 
 	pi.on("agent_start", (_event, eventCtx) => {

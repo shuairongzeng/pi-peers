@@ -303,6 +303,152 @@ describe("createPeerMessageTool project scoping", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tool: batch sends (to as an array)
+// ---------------------------------------------------------------------------
+
+describe("createPeerMessageTool batch sends", () => {
+	const selfRecord = record({
+		pid: 100,
+		name: "me",
+		cwd: "D:/work/alpha",
+		projectRoot: "D:/work/alpha",
+		sessionId: "1000000000000000",
+	});
+	const alpha = record({
+		pid: 200,
+		name: "alpha",
+		cwd: "D:/work/alpha/sub",
+		projectRoot: "D:/work/alpha",
+		sessionId: "2000000000000000",
+	});
+	const beta = record({
+		pid: 300,
+		name: "beta",
+		cwd: "D:/work/alpha/deep",
+		projectRoot: "D:/work/alpha",
+		sessionId: "3000000000000000",
+	});
+	const gamma = record({
+		pid: 400,
+		name: "gamma",
+		cwd: "D:/work/gamma",
+		projectRoot: "D:/work/gamma",
+		sessionId: "4000000000000000",
+	});
+
+	it("batch-sends to each target and summarizes one line per target", async () => {
+		const calls: Array<[string, string, { priority?: string; notifyWhenIdle?: boolean }]> = [];
+		const outbox = makeOutbox(async (target, body, opts) => {
+			calls.push([target, body, opts]);
+			if (target === "gamma") {
+				// gamma is offline: a dead process is the classic batch failure.
+				throw new PeerSendError("offline", 'peer "gamma" (pid 400) has a registry record but its process is dead');
+			}
+			return { msgId: `msg-${target}-1234567890`, to: `pipe:LOCAL\\pi-peer-${target}`, toName: target };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, beta], ownPid: 100 }));
+		const result = await runTool(tool, { to: ["alpha", "beta", "gamma"], message: "hi" }, "D:/work/alpha");
+
+		expect(calls).toHaveLength(3);
+		expect(calls.map((c) => c[0])).toEqual(["alpha", "beta", "gamma"]);
+		for (const [, body, opts] of calls) {
+			expect(body).toBe("hi");
+			expect(opts).toEqual({ priority: undefined, notifyWhenIdle: undefined });
+		}
+		// The offline peer (gamma) is the classic one-target failure; alpha and
+		// beta succeed, so the batch is a partial success, not an error.
+		expect(result.isError).toBe(false);
+		const text = textOf(result);
+		expect(text).toContain("✓ alpha — sent (msg_id msg-alph…)");
+		expect(text).toContain("✓ beta — sent (msg_id msg-beta…)");
+		expect(text).toContain("✗ gamma:");
+		expect(text).toContain("2 of 3 targets");
+		const details = result.details as Array<{ to: string; ok: boolean; msgId?: string; error?: string; code?: string }>;
+		expect(details).toEqual([
+			{ to: "alpha", ok: true, msgId: "msg-alpha-1234567890" },
+			{ to: "beta", ok: true, msgId: "msg-beta-1234567890" },
+			{
+				to: "gamma",
+				ok: false,
+				error: 'peer "gamma" (pid 400) has a registry record but its process is dead',
+				code: "offline",
+			},
+		]);
+	});
+
+	it("all targets failing sets isError", async () => {
+		const outbox = makeOutbox(async (target) => {
+			throw new PeerSendError("offline", `peer "${target}" is dead`);
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
+		const result = await runTool(tool, { to: ["alpha", "beta"], message: "hi" }, "D:/work/alpha");
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("✗ alpha:");
+		expect(text).toContain("✗ beta:");
+	});
+
+	it("rejects an array combined with notifyWhenIdle", async () => {
+		let sends = 0;
+		const outbox = makeOutbox(async () => {
+			sends++;
+			return { msgId: "m-1", to: "x" };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
+		const result = await runTool(
+			tool,
+			{ to: ["alpha", "beta"], message: "hi", notifyWhenIdle: true },
+			"D:/work/alpha",
+		);
+		expect(sends).toBe(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("Invalid target");
+		expect(text).toContain("notifyWhenIdle");
+	});
+
+	it("a cross-project target in a batch fails alone while the rest succeed", async () => {
+		const calls: string[] = [];
+		const outbox = makeOutbox(async (target) => {
+			calls.push(target);
+			return { msgId: `msg-${target}-1234567890`, to: `pipe:LOCAL\\pi-peer-${target}`, toName: target };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, gamma], ownPid: 100 }));
+		const result = await runTool(tool, { to: ["alpha", "gamma"], message: "hi" }, "D:/work/alpha");
+
+		// gamma lives in D:/work/gamma: the scope gate refuses it before the
+		// outbox, while alpha goes through.
+		expect(calls).toEqual(["alpha"]);
+		expect(result.isError).toBe(false);
+		const text = textOf(result);
+		expect(text).toContain("✓ alpha — sent (msg_id msg-alph…)");
+		expect(text).toContain("✗ gamma:");
+		expect(text).toContain("D:/work/gamma");
+		expect(text).toContain('scope: "all"');
+		const details = result.details as Array<{ to: string; ok: boolean; code?: string }>;
+		expect(details[0]).toEqual({ to: "alpha", ok: true, msgId: "msg-alpha-1234567890" });
+		expect(details[1].to).toBe("gamma");
+		expect(details[1].ok).toBe(false);
+		expect(details[1].code).toBe("invalid_target");
+	});
+
+	it("batch with scope:all reaches a cross-project target", async () => {
+		const calls: string[] = [];
+		const outbox = makeOutbox(async (target) => {
+			calls.push(target);
+			return { msgId: `msg-${target}-1234567890`, to: `pipe:LOCAL\\pi-peer-${target}`, toName: target };
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, gamma], ownPid: 100 }));
+		const result = await runTool(tool, { to: ["alpha", "gamma"], message: "hi", scope: "all" }, "D:/work/alpha");
+		expect(calls).toEqual(["alpha", "gamma"]);
+		expect(result.isError).toBeUndefined();
+		const text = textOf(result);
+		expect(text).toContain("✓ alpha");
+		expect(text).toContain("✓ gamma");
+	});
+});
+
+// ---------------------------------------------------------------------------
 // Tool: PeerSendError codes
 // ---------------------------------------------------------------------------
 

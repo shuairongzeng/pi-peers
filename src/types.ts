@@ -47,6 +47,11 @@ export interface PeersExtensionContext {
 	sessionManager: PeersSessionManager;
 	/** Whether the agent is currently idle (both pi and oh-my-pi expose this). */
 	isIdle(): boolean;
+	/**
+	 * Host-reported context-window fill (pi/omp both expose this; optional so
+	 * older or smaller hosts simply omit the snapshot from the record).
+	 */
+	getContextUsage?: () => { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
 }
 
 /** Tool-execution context (peers uses nothing beyond the base context). */
@@ -200,6 +205,16 @@ export interface PeerRecord {
 	 * written by older plugin versions (treat missing as `cwd`).
 	 */
 	projectRoot?: string;
+	/**
+	 * Best-effort snapshot of the session's context-window fill, refreshed on
+	 * status flips. All fields optional/absent when the host cannot report
+	 * usage. Lets `/peers` show "busy" with a *why* (context nearly full).
+	 */
+	contextUsage?: {
+		tokens?: number | null;
+		contextWindow?: number;
+		percent?: number | null;
+	};
 	name: string;
 	nameSource: PeerNameSource;
 	formerNames: PeerFormerName[];
@@ -586,6 +601,13 @@ export interface PeerHost {
 	hasUI(): boolean;
 	/** Effective accept policy after env/default resolution. */
 	acceptPolicy(): PeerAcceptPolicy;
+	/**
+	 * Whether the host session is idle right now (no agent run in flight).
+	 * Used to fire notify_when_idle subscriptions immediately when the target
+	 * is already idle (otherwise the subscription would wait for the *next*
+	 * busy→idle transition that may never come).
+	 */
+	isIdleNow(): boolean;
 }
 
 export interface PeerServiceDeps {

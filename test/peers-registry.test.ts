@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createPeerRegistry, parseProcStatStarttime } from "../src/registry.ts";
 import type { PeerRecord, PeerRegistry } from "../src/types.ts";
 
@@ -504,5 +504,109 @@ describe("pidDomain", () => {
 	it("is stable across calls", () => {
 		freshRegistry();
 		expect(registry.pidDomain()).toBe(registry.pidDomain());
+	});
+});
+
+describe("alive-cache", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	/**
+	 * Count real probes for one pid without changing their verdicts: isAlive()
+	 * probes via process.kill(pid, 0), so wrapping the original (bound before
+	 * the spy — calling process.kill inside would recurse into the mock) keeps
+	 * real liveness semantics while making the probe count observable.
+	 */
+	function probeCountFor(pid: number): () => number {
+		const probed: number[] = [];
+		const realKill = process.kill.bind(process);
+		vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: number | string) => {
+			if (target === pid) {
+				probed.push(target);
+			}
+			return realKill(target, signal);
+		}) as typeof process.kill);
+		return () => probed.length;
+	}
+
+	it("probes a live pid once when two list() calls fall in the same TTL window", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		expect(registry.list()).toHaveLength(1);
+		expect(probeCount()).toBe(1);
+	});
+
+	it("re-probes after the TTL expires", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list();
+		vi.advanceTimersByTime(1_500); // At/after the TTL boundary: verdict stale.
+		expect(registry.list()).toHaveLength(1);
+		expect(probeCount()).toBe(2);
+	});
+
+	it("never caches a dead verdict: dead pids are probed on both list() calls and swept", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(DEAD_PID);
+		registry.publish(makeRecord(DEAD_PID, { name: "ghost" }));
+		const first = registry.list();
+		expect(first).toHaveLength(1);
+		expect(first[0].live).toBe(false);
+		expect(existsSync(recordFile(DEAD_PID))).toBe(false); // Swept on first pass.
+		// Second scan: the file is already gone, but any re-published record would
+		// be probed again — false is never cached. Simulate by re-publishing.
+		registry.publish(makeRecord(DEAD_PID, { name: "ghost" }));
+		const second = registry.list();
+		expect(second[0].live).toBe(false);
+		expect(probeCount()).toBe(2); // Probed in both scans despite the same pid.
+	});
+
+	it("invalidates the cached verdict on unpublish", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list();
+		expect(probeCount()).toBe(1);
+		registry.unpublish(LIVE_PID);
+		// Fresh publish right after suicide: the old cached verdict must not apply.
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list();
+		expect(probeCount()).toBe(2);
+	});
+
+	it("survives a list() round trip with contextUsage intact", () => {
+		freshRegistry();
+		const usage = { tokens: 12_000, contextWindow: 200_000, percent: 6 };
+		registry.publish(makeRecord(LIVE_PID, { name: "alice", contextUsage: usage }));
+		const entries = registry.list();
+		expect(entries).toHaveLength(1);
+		expect(entries[0].record.contextUsage).toEqual(usage);
+	});
+
+	it("round-trips a partial contextUsage (only percent set)", () => {
+		freshRegistry();
+		registry.publish(makeRecord(LIVE_PID, { name: "alice", contextUsage: { percent: 42 } }));
+		const entries = registry.list();
+		expect(entries[0].record.contextUsage).toEqual({ percent: 42 });
+	});
+
+	it("rejects a non-object contextUsage", () => {
+		freshRegistry();
+		const bad = { ...makeRecord(LIVE_PID), contextUsage: "42%" } as unknown as PeerRecord;
+		writeFileSync(recordFile(LIVE_PID), JSON.stringify(bad));
+		expect(registry.list()).toEqual([]);
 	});
 });

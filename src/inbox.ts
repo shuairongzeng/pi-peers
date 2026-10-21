@@ -161,6 +161,17 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 					// the sender either misbehaved or would loop notices back to itself.
 					return;
 				}
+				if (host.isIdleNow()) {
+					// Already idle: fire immediately instead of parking a subscription
+					// that would only flush on a future busy→idle transition.
+					sendIdleNotice({
+						replyTo: frame.reply_to,
+						from: frame.from,
+						fromName: frame.fromName,
+						nonce: frame.nonce,
+					});
+					return;
+				}
 				idleSubs.set(frame.msg_id, {
 					replyTo: frame.reply_to,
 					from: frame.from,
@@ -184,20 +195,30 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 		await handleUserFrame(frame, senderClass);
 	}
 
+	/**
+	 * Build and fire one idle notice for a subscription. Shared by the
+	 * busy→idle flush (onIdle) and the already-idle immediate path so both
+	 * produce identical frames; sendControl is best-effort by contract.
+	 */
+	function sendIdleNotice(sub: IdleSub): void {
+		const notice: PeerIdleNoticeFrame = {
+			...protocol.newEnvelope(),
+			type: "control",
+			action: "peer_idle_notice",
+			from: identity.socketAddress,
+			fromName: identity.name,
+			...(sub.nonce !== undefined ? { nonce: sub.nonce } : {}),
+		};
+		void deps.outbox.sendControl(sub.replyTo, notice);
+	}
+
+	/** Fire pending subscriptions when the local agent transitions to idle. */
 	function onIdle(): void {
 		const subs = Array.from(idleSubs.values());
 		idleSubs.clear();
 		queued = 0;
 		for (const sub of subs) {
-			const notice: PeerIdleNoticeFrame = {
-				...protocol.newEnvelope(),
-				type: "control",
-				action: "peer_idle_notice",
-				from: identity.socketAddress,
-				fromName: identity.name,
-				...(sub.nonce !== undefined ? { nonce: sub.nonce } : {}),
-			};
-			void deps.outbox.sendControl(sub.replyTo, notice);
+			sendIdleNotice(sub);
 		}
 	}
 

@@ -14,12 +14,15 @@ import { type Static, Type } from "typebox";
 import type {
 	PeersCommandContext,
 	PeersToolDefinition,
+	PeersToolResult,
 	PeerRecord,
 	PeerRegistry,
+	PeerSendOptions,
+	PeerSendOutcome,
 	PeerToolDeps,
 } from "./types.ts";
 import { PeerSendError, normalizeFsPath, projectRootOf, sameProject } from "./types.ts";
-import type { PeerRegistryEntry } from "./types.ts";
+import type { PeerRegistryEntry, PeerSendErrorCode } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Tool
@@ -36,12 +39,28 @@ export const peerMessageSchema = Type.Object({
 		}),
 	),
 	to: Type.Optional(
-		Type.String({
-			description:
-				'Peer name to send to, as shown by action="list" (e.g. "alice"). ' +
-				'When several sessions share a name, append the disambiguation ref from the candidate list: "alice [ab12cd]". ' +
-				"Required for send; ignored for list.",
-		}),
+		Type.Union(
+			[
+				Type.String({
+					description:
+						'Peer name to send to, as shown by action="list" (e.g. "alice"). ' +
+						'When several sessions share a name, append the disambiguation ref from the candidate list: "alice [ab12cd]". ' +
+						"Required for send; ignored for list.",
+				}),
+				Type.Array(Type.String(), {
+					minItems: 1,
+					maxItems: 32,
+					description:
+						"Array of 1–32 peer names for a batch send: the same message goes to every target. " +
+						"A failing target does not stop the rest; the result lists one line per target. " +
+						"Cannot be combined with notifyWhenIdle.",
+				}),
+			],
+			{
+				description:
+					"Send target(s): a single peer name, or an array of peer names to batch-send the same message to all of them.",
+			},
+		),
 	),
 	message: Type.Optional(
 		Type.String({
@@ -85,6 +104,7 @@ Sends a message to another running pi instance ("peer") on the same machine. The
 - \`notifyWhenIdle\`: also subscribes (once) to be notified when the peer next becomes idle.
 - Success only means the message reached the peer's queue. A receipt (delivered / held / denied / expired / refused / dropped) follows asynchronously and is injected into your context when it arrives.
 - Silence is not consent: no reply within a timeout does not mean the peer agreed or acted.
+- \`to\` accepts an array of peer names (up to 32) to batch-send the same message to all of them: one send per target, a failing target does not stop the rest, and the result reports one line per target. Batch sends cannot use \`notifyWhenIdle\`.
 - For large content, write it to a file and send the file path in the message; each message is capped at 1 MiB on the wire.`;
 
 function peerLine(record: PeerRecord, ref: string, self: boolean): string {
@@ -194,6 +214,43 @@ function describeSendError(error: PeerSendError, registry: PeerRegistry, selfPid
 	}
 }
 
+/** One structured per-target entry in a batch send's details. */
+interface PeerBatchSendDetail {
+	to: string;
+	ok: boolean;
+	msgId?: string;
+	error?: string;
+	code?: PeerSendErrorCode;
+}
+
+type SendAttempt = { ok: true; outcome: PeerSendOutcome } | { ok: false; error: unknown };
+
+/**
+ * One outbox send, including the project-scope gate: a cross-project target
+ * under the default scope is refused before the outbox is called, matching the
+ * single-target behavior.
+ */
+async function attemptSend(
+	deps: PeerToolDeps,
+	target: string,
+	message: string,
+	opts: PeerSendOptions,
+	scope: "project" | "all",
+	selfCwd: string,
+): Promise<SendAttempt> {
+	if (scope === "project") {
+		const crossProject = findCrossProjectTarget(deps, target, selfCwd);
+		if (crossProject !== undefined) {
+			return { ok: false, error: crossProject };
+		}
+	}
+	try {
+		return { ok: true, outcome: await deps.outbox.send(target, message, opts) };
+	} catch (error) {
+		return { ok: false, error };
+	}
+}
+
 export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<PeerMessageInput> {
 	return {
 		name: PEER_MESSAGE_TOOL_NAME,
@@ -208,7 +265,7 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 					details: {},
 				};
 			}
-			if (!params.to || !params.message) {
+			if (!params.to || (Array.isArray(params.to) && params.to.length === 0) || !params.message) {
 				return {
 					content: [
 						{
@@ -220,49 +277,89 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 					isError: true,
 				};
 			}
-			// Project scoping gate: resolve within the same project first; when
-			// that finds nothing, check whether the target lives in another
-			// project and report it as an explicit cross-project refusal.
-			if (scope === "project") {
-				const crossProject = findCrossProjectTarget(deps, params.to, ctx.cwd);
-				if (crossProject !== undefined) {
+			// The idle subscription is per-target and one-shot; a batch would have
+			// to invent semantics for it, so refuse the combination up front.
+			if (Array.isArray(params.to) && params.notifyWhenIdle === true) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: 'Invalid target: "to" cannot be an array when notifyWhenIdle is true. Batch sends do not support idle subscriptions; send to a single peer to subscribe.',
+						},
+					],
+					details: {},
+					isError: true,
+				};
+			}
+			const sendOpts: PeerSendOptions = {
+				priority: params.priority,
+				notifyWhenIdle: params.notifyWhenIdle,
+			};
+			if (!Array.isArray(params.to)) {
+				const attempted = await attemptSend(deps, params.to, params.message, sendOpts, scope, ctx.cwd);
+				if (attempted.ok) {
+					const target = attempted.outcome.toName ? `"${attempted.outcome.toName}"` : "peer";
 					return {
 						content: [
 							{
 								type: "text",
-								text: describeSendError(crossProject, deps.registry, deps.identity.pid),
+								text: `Sent to ${target} [${attempted.outcome.to}] (msg_id ${attempted.outcome.msgId}). Receipt will follow asynchronously.`,
+							},
+						],
+						details: {},
+					};
+				}
+				if (attempted.error instanceof PeerSendError) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: describeSendError(attempted.error, deps.registry, deps.identity.pid),
 							},
 						],
 						details: {},
 						isError: true,
 					};
 				}
+				throw attempted.error;
 			}
-			try {
-				const outcome = await deps.outbox.send(params.to, params.message, {
-					priority: params.priority,
-					notifyWhenIdle: params.notifyWhenIdle,
-				});
-				const target = outcome.toName ? `"${outcome.toName}"` : "peer";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Sent to ${target} [${outcome.to}] (msg_id ${outcome.msgId}). Receipt will follow asynchronously.`,
-						},
-					],
-					details: {},
-				};
-			} catch (error) {
-				if (error instanceof PeerSendError) {
-					return {
-						content: [{ type: "text", text: describeSendError(error, deps.registry, deps.identity.pid) }],
-						details: {},
-						isError: true,
-					};
+			// Batch: one send per target; a failing target never stops the rest.
+			const details: PeerBatchSendDetail[] = [];
+			const lines: string[] = [];
+			let failures = 0;
+			for (const target of params.to) {
+				const attempted = await attemptSend(deps, target, params.message, sendOpts, scope, ctx.cwd);
+				if (attempted.ok) {
+					details.push({ to: target, ok: true, msgId: attempted.outcome.msgId });
+					lines.push(`✓ ${target} — sent (msg_id ${attempted.outcome.msgId.slice(0, 8)}…)`);
+					continue;
 				}
-				throw error;
+				failures++;
+				const failureText = attempted.error instanceof Error ? attempted.error.message : String(attempted.error);
+				if (attempted.error instanceof PeerSendError) {
+					details.push({ to: target, ok: false, error: failureText, code: attempted.error.code });
+				} else {
+					details.push({ to: target, ok: false, error: failureText });
+				}
+				lines.push(`✗ ${target}: ${failureText}`);
 			}
+			const okCount = params.to.length - failures;
+			const header =
+				failures === 0
+					? `Sent to ${params.to.length} peers. Receipts will follow asynchronously.`
+					: okCount === 0
+						? `Send failed for all ${params.to.length} targets.`
+						: `Sent to ${okCount} of ${params.to.length} targets; ${failures} failed.`;
+			const result: PeersToolResult = {
+				content: [{ type: "text", text: `${header}\n${lines.join("\n")}` }],
+				details,
+			};
+			if (failures === params.to.length) {
+				result.isError = true;
+			} else if (failures > 0) {
+				result.isError = false;
+			}
+			return result;
 		},
 	};
 }

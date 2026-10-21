@@ -56,16 +56,16 @@ Talk to your agent in natural language — it has a `send_peer_message` tool and
 
 Or drive it yourself:
 
-- `/peers` — list live peer sessions (name, status, kind, working directory, disambiguation ref).
+- `/peers` — list live peer sessions (name, status, context fill `ctx N%` when the host reports it, kind, working directory, disambiguation ref).
 
 Tool reference (what the model sees):
 
 | Call | Effect |
 | --- | --- |
 | `send_peer_message { action: "list" }` | Discover live peers on this machine. |
-| `send_peer_message { action: "send", to, message }` | Deliver `message` to the peer's agent. `to` accepts a name (`"alice"`), a disambiguated name (`"alice [ab12cd]"`), or a wire address copied from an incoming message. |
+| `send_peer_message { action: "send", to, message }` | Deliver `message` to the peer's agent. `to` accepts a name (`"alice"`), a disambiguated name (`"alice [ab12cd]"`), a wire address copied from an incoming message, **or an array of any of those** to fan out the same message to up to 32 peers in one call (per-target results are aggregated; one failure doesn't abort the rest). |
 | `… { priority: "now" }` | Interrupt the peer's current work immediately instead of queueing behind it. |
-| `… { notifyWhenIdle: true }` | One-shot ping back to you when the peer next goes idle. |
+| `… { notifyWhenIdle: true }` | One-shot ping back to you when the peer goes idle — fires immediately if the peer is already idle. (Single-target sends only.) |
 | `… { scope: "all" }` | Reach sessions in **other projects** (see below). |
 
 ### Project scope
@@ -127,6 +127,20 @@ npm run typecheck  # tsc --noEmit
 Source layout: `src/` holds the plugin; `src/types.ts` is the single dependency contract every module imports from; `src/index.ts` is the dual-host entry (pi + oh-my-pi API differences are normalized there). Tests in `test/` include a true end-to-end suite (two real protocol stacks exchanging frames over a live socket) and a dual-host wiring suite.
 
 The protocol and interaction model are derived from a clean-room analysis of Claude Code's cross-session messaging, adapted to the pi extension API. Design rationale and the full reverse-engineering writeup live in the companion docs.
+
+## Protocol appendix (for third-party implementers)
+
+Everything below is the wire-visible contract; interoperable implementations must match it.
+
+**Discovery.** `$PI_PEERS_DIR` (default `~/.pi-peers/`), mode `0700`. Each instance publishes `<pid>.json` (record: `version, pid, sessionId, cwd, projectRoot?, name, nameSource, formerNames, kind, status, statusUpdatedAt, startedAt, procStart, pidDomain, socketPath, peerProtocol, features[], contextUsage?`) and `<pid>.<sha256(socketPath)>.key` (mode `0600`, `{peerToken, childToken, procStart, pidDomain}`). Atomic tmp+rename writes; a `list()` scan sweeps records whose pid is dead (liveness = `kill(pid,0)` + process-start-token compare) along with their key files.
+
+**Channel.** One short-lived connection per message. Windows: named pipe `\\.\pipe\LOCAL\pi-peer-<32 hex>`; POSIX: unix socket under `<registry>/sock-<uid>/`. Newline-delimited JSON, 1 MiB line cap, 30 s first-line budget.
+
+**Handshake.** First line `{"type":"auth","token":"<peerToken from the target's key file>"}`. Windows requires auth; POSIX additionally validates peer uid/pid + procStart. A parent hands its socket address + child token to spawned subagents via `PI_PEERS_SOCKET`/`PI_PEERS_TOKEN`; a child token marks the sender as first-class (no consent prompt, not hop-counted).
+
+**Frames.** Envelope `{msgV:1, msg_id:uuid}` + `type: "user" | "control"`. User frame: `from/fromPid/fromSession`, optional `fromName`, `hopChain` (self-hop ≥10 drops, chain >28 drops), `priority: "now"|"next"`, `content` — for model-authored sends, content is wrapped as `<cross-session-message from="ADDR" from-name="NAME">…</cross-session-message>`. Control actions: `peer_message_status` (receipts: `held → delivered|denied|expired`, `refused`, `dropped:<reason>`), `notify_when_idle` (one-shot, nonce-correlated; fires immediately when the target is already idle), `peer_idle_notice`, `rename` (formerNames chaining).
+
+**Anti-abuse on receive.** Per-sender token bucket (30 burst, 0.5/s refill), 30 s dedupe window, queue cap 50. Receipts flow back over a fresh connection to `reply_to`.
 
 ## License
 

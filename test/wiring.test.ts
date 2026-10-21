@@ -242,6 +242,23 @@ describe("peers plugin wiring (dual-host)", () => {
 		expect(returned.systemPrompt).not.toBe(input);
 	});
 
+	it("degrades to local-only when the registry dir is unusable", async () => {
+		// PI_PEERS_DIR points at a regular file: listen-side setup (key publish on
+		// POSIX dir creation / publishKey mkdir) and record publish both fail; the
+		// session must still come up, with a warning instead of an exception.
+		const notADir = join(peersDir, "not-a-dir");
+		writeFileSync(notADir, "x");
+		process.env.PI_PEERS_DIR = notADir;
+		const { pi, handlers } = createFakePi();
+		peersExtension(pi);
+		const messages: string[] = [];
+		const ctx = createFakeCtx(notADir, {
+			ui: { notify: (m: string) => messages.push(m), confirm: async () => true },
+		});
+		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+		expect(messages.some((m) => m.includes("peers:"))).toBe(true);
+	});
+
 	it("flips status busy on agent_start, idle on agent_settled and plain agent_end, stays busy on omp continuation agent_end", async () => {
 		const { pi, handlers } = createFakePi();
 		peersExtension(pi);
