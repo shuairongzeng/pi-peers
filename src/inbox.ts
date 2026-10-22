@@ -11,6 +11,7 @@
 
 import {
 	PEER_APPROVAL_TIMEOUT_MS,
+	PEER_MAX_QUEUED_MESSAGES,
 	type PeerAcceptPolicy,
 	type PeerControlFrame,
 	type PeerFrame,
@@ -44,8 +45,13 @@ const PREVIEW_MAX_CHARS = 500;
 export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }): PeerInbox {
 	const { identity, protocol, transport, guard, host } = deps;
 
-	/** Number of accepted peer messages queued in the agent. */
-	let queued = 0;
+	/**
+	 * Number of peer messages accepted since the last idle transition. Not a
+	 * real queue: injected messages are not waiting for the agent — this is a
+	 * documented cap so a busy stretch cannot hide rate/dedup signals from the
+	 * guard (guard sees an ever-growing count, and the reset-on-idle bounds it).
+	 */
+	let acceptedSinceIdle = 0;
 	/** One-shot notify_when_idle subscriptions, keyed by their envelope msg_id. */
 	const idleSubs = new Map<string, IdleSub>();
 
@@ -79,19 +85,43 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	}
 
 	/**
-	 * Route one inbound user frame through guard → accept policy → injection.
-	 * Receipts are sent via the outbox (best-effort by contract) and failures
-	 * there never mask the outcome of the message itself.
+	 * Route one inbound user frame through wrapper validation → guard → accept
+	 * policy → injection. Receipts are sent via the outbox (best-effort by
+	 * contract) and failures there never mask the outcome of the message itself.
 	 */
 	async function handleUserFrame(frame: PeerUserFrame, senderClass: "peer" | "child"): Promise<void> {
+		// The wrapper is mandatory on the receive side: parse it strictly
+		// (round-trip fidelity rejects tampered/forged wrappers), then re-wrap
+		// with the wire identity from the frame so the agent never sees content
+		// that was not reconstructed under our control.
+		const parsed = protocol.parsePeerContent(frame.content);
+		if (parsed === undefined) {
+			await sendReceipt(frame, "dropped", "malformed-wrapper");
+			return;
+		}
+		const content = protocol.wrapPeerContent(
+			{
+				from: frame.from,
+				fromSession: frame.fromSession,
+				...(frame.fromName !== undefined && frame.fromName !== ""
+					? { fromName: protocol.sanitizePeerText(frame.fromName) }
+					: {}),
+			},
+			parsed.body,
+		);
+
 		if (senderClass === "child") {
-			await inject(frame, senderClass);
+			await inject(frame, content, senderClass);
 			return;
 		}
 
-		const verdict = guard.check(frame.from, frame, identity.hopToken, queued);
+		const verdict = guard.check(frame.from, frame, identity.hopToken, acceptedSinceIdle);
 		if (!verdict.ok) {
-			await sendReceipt(frame, "dropped", verdict.reason);
+			const reason =
+				verdict.reason === "queue-full"
+					? `queue-full: peer has accepted ${PEER_MAX_QUEUED_MESSAGES} messages since its last idle; retry after it goes idle`
+					: verdict.reason;
+			await sendReceipt(frame, "dropped", reason);
 			return;
 		}
 
@@ -101,7 +131,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			return;
 		}
 		if (policy === "all") {
-			await inject(frame, senderClass);
+			await inject(frame, content, senderClass);
 			return;
 		}
 
@@ -113,9 +143,9 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 
 		await sendReceipt(frame, "held", undefined);
 		const preview =
-			frame.content.length > PREVIEW_MAX_CHARS ? `${frame.content.slice(0, PREVIEW_MAX_CHARS)}…` : frame.content;
+			parsed.body.length > PREVIEW_MAX_CHARS ? `${parsed.body.slice(0, PREVIEW_MAX_CHARS)}…` : parsed.body;
 		const answer = await host.confirm(
-			`Peer message from ${frame.fromName ?? frame.from}`,
+			`Peer message from ${protocol.sanitizePeerText(frame.fromName ?? frame.from)}`,
 			preview,
 			PEER_APPROVAL_TIMEOUT_MS,
 		);
@@ -127,19 +157,23 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			await sendReceipt(frame, "expired", "approval timed out");
 			return;
 		}
-		await inject(frame, senderClass);
+		await inject(frame, content, senderClass);
 	}
 
-	/** Step e: record acceptance, queue, and inject into the agent. */
-	async function inject(frame: PeerUserFrame, senderClass: "peer" | "child"): Promise<void> {
+	/** Step e: record acceptance, count, and inject into the agent. */
+	async function inject(
+		frame: PeerUserFrame,
+		content: string,
+		senderClass: "peer" | "child",
+	): Promise<void> {
 		if (senderClass !== "child") {
 			guard.recordAccepted(frame.from, frame);
 		}
-		queued++;
+		acceptedSinceIdle++;
 		try {
-			await host.injectUserMessage(frame.content, frame.priority);
+			await host.injectUserMessage(content, frame.priority);
 		} catch (error) {
-			queued--;
+			acceptedSinceIdle--;
 			if (senderClass !== "child") {
 				guard.refund(frame.from);
 			}
@@ -180,37 +214,48 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 				});
 				return;
 			}
-			case "peer_idle_notice": {
-				await host.injectAgentNotice(`Peer "${frame.fromName ?? frame.from}" is now idle.`);
+		case "peer_idle_notice": {
+			// One-shot nonce: unsolicited, reused, or missing nonces are dropped
+			// silently — only notices answering our subscription get through.
+			if (!deps.outbox.consumeIdleNonce(frame.nonce)) {
 				return;
 			}
-			case "shutdown": {
-				// Peer-requested shutdown of this session. The host's quit path
-				// triggers session_shutdown (unpublish + server teardown); the
-				// inbox never tears down transport state itself.
-				const policy = host.acceptPolicy();
-				if (policy === "off") {
+			const peerName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+			await host.injectAgentNotice(`Peer "${peerName}" is now idle.`);
+			return;
+		}
+		case "shutdown": {
+			// Peer-requested shutdown of this session. The host's quit path
+			// triggers session_shutdown (unpublish + server teardown); the
+			// inbox never tears down transport state itself.
+			const policy = host.acceptPolicy();
+			if (policy === "off") {
+				return;
+			}
+			if (policy === "ask") {
+				const fromName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+				const sender =
+					frame.fromName === undefined ? fromName : `"${fromName}" (${protocol.sanitizePeerText(frame.from)})`;
+				const reason =
+					frame.reason === undefined ? "" : `\nReason: ${protocol.sanitizePeerText(frame.reason)}`;
+				const answer = await host.confirm(
+					"Peer shutdown request",
+					`Peer ${sender} asks to shut down this session.${reason}`,
+					PEER_APPROVAL_TIMEOUT_MS,
+				);
+				if (answer !== "yes") {
 					return;
 				}
-				if (policy === "ask") {
-					const sender =
-						frame.fromName === undefined ? frame.from : `"${frame.fromName}" (${frame.from})`;
-					const reason = frame.reason === undefined ? "" : `\nReason: ${frame.reason}`;
-					const answer = await host.confirm(
-						"Peer shutdown request",
-						`Peer ${sender} asks to shut down this session.${reason}`,
-						PEER_APPROVAL_TIMEOUT_MS,
-					);
-					if (answer !== "yes") {
-						return;
-					}
-				}
-				host.notify("peers", `Shutting down at request of peer ${frame.fromName ?? frame.from}`);
-				host.quit();
-				return;
 			}
+			host.notify(
+				"peers",
+				`Shutting down at request of peer ${protocol.sanitizePeerText(frame.fromName ?? frame.from)}`,
+			);
+			host.quit();
+			return;
 		}
 	}
+}
 
 	async function handleFrame(frame: PeerFrame, senderClass: "peer" | "child"): Promise<void> {
 		if (frame.type === "control") {
@@ -241,14 +286,14 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	function onIdle(): void {
 		const subs = Array.from(idleSubs.values());
 		idleSubs.clear();
-		queued = 0;
+		acceptedSinceIdle = 0;
 		for (const sub of subs) {
 			sendIdleNotice(sub);
 		}
 	}
 
 	function pendingCount(): number {
-		return queued;
+		return acceptedSinceIdle;
 	}
 
 	return { handleFrame, onIdle, pendingCount };

@@ -71,6 +71,10 @@ const fakeOutbox = (sent: Array<{ target: string; content: string }>) => ({
 	sendControl: async () => {},
 	receiptOf: () => undefined,
 	handleReceipt: () => {},
+	registerOutbound: () => {},
+	expectsReceipt: () => false,
+	registerIdleNonce: () => {},
+	consumeIdleNonce: () => false,
 });
 
 describe("hostCommand", () => {
@@ -120,6 +124,21 @@ describe("createPeerSpawner", () => {
 			expect(outcome2.name).toBe("researcher-2");
 		} finally {
 			keeper.kill();
+		}
+	});
+
+	it("does not leak the parent's ephemeral flag to non-ephemeral children", async () => {
+		process.env[ENV_PEERS_EPHEMERAL] = "1";
+		try {
+			const captured: { env?: NodeJS.ProcessEnv } = {};
+			const spawner = createPeerSpawner({ registry: createPeerRegistry(peersDir), outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
+			await spawner({ name: "persistent-helper" });
+			expect(captured.env?.[ENV_PEERS_EPHEMERAL]).toBeUndefined();
+			// …and sets it only when explicitly requested.
+			await spawner({ name: "short-lived", ephemeral: true });
+			expect(captured.env?.[ENV_PEERS_EPHEMERAL]).toBe("1");
+		} finally {
+			delete process.env[ENV_PEERS_EPHEMERAL];
 		}
 	});
 

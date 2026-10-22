@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { createPeerInbox } from "../src/inbox.ts";
 import { createPeerOutbox } from "../src/outbox.ts";
+import { createPeerProtocol } from "../src/protocol.ts";
 import {
 	PEER_APPROVAL_TIMEOUT_MS,
+	PEER_MAX_QUEUED_MESSAGES,
 	PEER_RECEIPT_TTL_MS,
 	type PeerAuth,
 	type PeerConnection,
@@ -256,20 +258,23 @@ function makeIdentity(overrides: Partial<PeerIdentity> = {}): PeerIdentity {
 	};
 }
 
-/** Minimal protocol fake: real serialization/wrapping, stubbed parsers. */
-const proto: PeerProtocol = {
-	newEnvelope: () => ({ msgV: 1, msg_id: `msg-${Math.random().toString(36).slice(2, 10)}` }),
-	serializeFrame: (frame) => `${JSON.stringify(frame)}\n`,
-	wrapPeerContent: (attrs, body) =>
-		`<cross-session-message${attrs.fromName ? ` from-name="${attrs.fromName}"` : ""}>\n${body}\n</cross-session-message>`,
-	parseFrameLine: () => undefined,
-	parsePeerContent: () => undefined,
-	buildAuthLine: (token) => `${JSON.stringify({ type: "auth", token })}\n`,
-	parseAuthLine: () => undefined,
-};
+/** Real protocol: wrapping/parsing/sanitizing must behave exactly as shipped. */
+const proto: PeerProtocol = createPeerProtocol();
 
-function userFrame(overrides: Partial<PeerUserFrame> = {}): PeerUserFrame {
-	return {
+/**
+ * Inbound user frames carry wire-wrapped content by contract. `body` is the
+ * message text to wrap; `rawContent` bypasses wrapping for tests that inject
+ * deliberately malformed content. The wrapper always mirrors the frame's wire
+ * identity, exactly as outbox.send does.
+ */
+function userFrame(
+	overrides: Partial<Omit<PeerUserFrame, "content">> & {
+		body?: string;
+		rawContent?: string;
+	} = {},
+): PeerUserFrame {
+	const { body = "hello from alpha", rawContent, ...rest } = overrides;
+	const frame: PeerUserFrame = {
 		msgV: 1,
 		msg_id: "incoming-1",
 		type: "user",
@@ -279,9 +284,18 @@ function userFrame(overrides: Partial<PeerUserFrame> = {}): PeerUserFrame {
 		fromName: "alpha",
 		hopChain: ["hop-peer"],
 		priority: "next",
-		content: "hello from alpha",
-		...overrides,
+		content: "",
+		...rest,
 	};
+	frame.content = rawContent ?? proto.wrapPeerContent(
+		{
+			from: frame.from,
+			fromSession: frame.fromSession,
+			fromName: frame.fromName,
+		},
+		body,
+	);
+	return frame;
 }
 
 function statusFrame(overrides: Partial<PeerMessageStatusFrame> = {}): PeerMessageStatusFrame {
@@ -302,6 +316,8 @@ interface ScriptedOutbox extends PeerOutbox {
 	controlCalls: Array<{ address: string; frame: PeerControlFrame }>;
 	receiptsHandled: PeerMessageStatusFrame[];
 	failControl: boolean;
+	/** Idle nonces registered by a test; consumption is one-shot like the real outbox. */
+	idleNonces: Set<string>;
 }
 
 function makeScriptedOutbox(): ScriptedOutbox {
@@ -309,6 +325,7 @@ function makeScriptedOutbox(): ScriptedOutbox {
 		controlCalls: [],
 		receiptsHandled: [],
 		failControl: false,
+		idleNonces: new Set<string>(),
 		async send(_target, _body, _opts) {
 			return { msgId: "m-1", to: "x", toName: "n" };
 		},
@@ -319,6 +336,14 @@ function makeScriptedOutbox(): ScriptedOutbox {
 		receiptOf: () => undefined,
 		handleReceipt(frame) {
 			this.receiptsHandled.push(frame);
+		},
+		registerOutbound() {},
+		expectsReceipt: () => false,
+		registerIdleNonce(nonce) {
+			this.idleNonces.add(nonce);
+		},
+		consumeIdleNonce(nonce) {
+			return nonce !== undefined && this.idleNonces.delete(nonce);
 		},
 	};
 }
@@ -350,34 +375,45 @@ describe("createPeerOutbox", () => {
 		};
 		const outbox = createPeerOutbox(deps);
 
-		const outcome = await outbox.send("alpha", "ping body", { priority: "now" });
+	const outcome = await outbox.send("alpha", "ping body", { priority: "now" });
 
-		expect(outcome).toEqual({
-			msgId: expect.stringMatching(/^msg-/),
-			to: alphaEntry.record.socketPath,
-			toName: "alpha",
-		});
-		expect(pacer.consumed).toEqual(["alpha"]);
-		expect(pacer.refunded).toEqual([]);
-		expect(transport.connects).toEqual([`pipe:LOCAL\\pi-peer-${"a".repeat(32)}`]);
-		expect(transport.sessions.length).toBe(1);
-		const conn = transport.sessions[0]!;
-		expect(conn.ended).toBe(true);
-		expect(conn.lines.length).toBe(2);
-		// Line 1: auth carrying the target's key token.
-		expect(JSON.parse(conn.lines[0]!)).toEqual({ type: "auth", token: "key-alpha" });
-		// Line 2: the user frame, field by field.
-		const frame = JSON.parse(conn.lines[1]!) as PeerUserFrame;
-		expect(frame.msgV).toBe(1);
-		expect(frame.msg_id).toBe(outcome.msgId);
-		expect(frame.type).toBe("user");
-		expect(frame.from).toBe(deps.identity.socketAddress);
-		expect(frame.fromPid).toBe(deps.identity.pid);
-		expect(frame.fromSession).toBe(deps.identity.sessionId);
-		expect(frame.fromName).toBe("me");
-		expect(frame.hopChain).toEqual([deps.identity.hopToken]);
-		expect(frame.priority).toBe("now");
-		expect(frame.content).toBe(`<cross-session-message from-name="me">\nping body\n</cross-session-message>`);
+	expect(outcome).toEqual({
+		msgId: expect.any(String),
+		to: alphaEntry.record.socketPath,
+		toName: "alpha",
+	});
+	expect(pacer.consumed).toEqual(["alpha"]);
+	expect(pacer.refunded).toEqual([]);
+	expect(transport.connects).toEqual([`pipe:LOCAL\\pi-peer-${"a".repeat(32)}`]);
+	expect(transport.sessions.length).toBe(1);
+	const conn = transport.sessions[0]!;
+	expect(conn.ended).toBe(true);
+	expect(conn.lines.length).toBe(2);
+	// Line 1: auth carrying the target's key token.
+	expect(JSON.parse(conn.lines[0]!)).toEqual({ type: "auth", token: "key-alpha" });
+	// Line 2: the user frame, field by field.
+	const frame = JSON.parse(conn.lines[1]!) as PeerUserFrame;
+	expect(frame.msgV).toBe(1);
+	expect(frame.msg_id).toBe(outcome.msgId);
+	expect(frame.type).toBe("user");
+	expect(frame.from).toBe(deps.identity.socketAddress);
+	expect(frame.fromPid).toBe(deps.identity.pid);
+	expect(frame.fromSession).toBe(deps.identity.sessionId);
+	expect(frame.fromName).toBe("me");
+	expect(frame.hopChain).toEqual([deps.identity.hopToken]);
+	expect(frame.priority).toBe("now");
+	expect(frame.content).toBe(
+		proto.wrapPeerContent(
+			{
+				from: deps.identity.socketAddress,
+				fromSession: deps.identity.sessionId,
+				fromName: "me",
+			},
+			"ping body",
+		),
+	);
+	// The sent msg_id is registered: receipts for it will be honored.
+	expect(outbox.expectsReceipt(outcome.msgId)).toBe(true);
 	});
 
 	it("defaults priority to next", async () => {
@@ -434,7 +470,7 @@ describe("createPeerOutbox", () => {
 		expect(JSON.parse(conn.lines[2]!).type).toBe("user");
 	});
 
-	it("throws not_found with live peer list and no-send hint", async () => {
+	it("throws not_found without a peer list and hints at stale addresses", async () => {
 		const beta = entry({ pid: 55, name: "beta", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"c".repeat(32)}` });
 		const dead = entry(
 			{ pid: 66, name: "dead-peer", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"d".repeat(32)}` },
@@ -464,12 +500,13 @@ describe("createPeerOutbox", () => {
 		} catch (error) {
 			message = error instanceof Error ? error.message : String(error);
 		}
-		expect(message).toContain("beta [37a1b2c]");
-		expect(message).toContain("alpha [");
+		// The outbox has no project-scope notion, so the error carries no
+		// machine-wide peer list (tool.ts renders the scoped candidates).
+		expect(message).toContain("no live peer matches");
+		expect(message).not.toContain("beta");
 		expect(message).not.toContain("dead-peer");
-		expect(message).toContain("may not be running");
+		expect(message).toContain("never reuse a stale address");
 	});
-
 	it("throws ambiguous with candidate lines name [ref] status cwd", async () => {
 		const a1 = entry({ pid: 11, cwd: "D:/one" });
 		const a2 = entry({
@@ -688,15 +725,20 @@ describe("createPeerOutbox", () => {
 		};
 		const outbox = createPeerOutbox(deps);
 
-		outbox.handleReceipt(statusFrame({ msg_id: "m-1", state: "held" }));
-		expect(outbox.receiptOf("m-1")).toBe("held");
-		outbox.handleReceipt(statusFrame({ msg_id: "m-1", state: "delivered" }));
-		expect(outbox.receiptOf("m-1")).toBe("delivered");
-		expect(host.notices).toEqual([]);
-		expect(host.userNotifies.length).toBe(2);
-		expect(host.userNotifies[0]!.title).toBe("Peer message");
+	// Only receipts for msg_ids we actually sent are honored.
+	outbox.registerOutbound("m-1");
+	outbox.handleReceipt(statusFrame({ msg_id: "m-1", state: "held" }));
+	expect(outbox.receiptOf("m-1")).toBe("held");
+	outbox.handleReceipt(statusFrame({ msg_id: "m-1", state: "delivered" }));
+	expect(outbox.receiptOf("m-1")).toBe("delivered");
+	expect(host.notices).toEqual([]);
+	expect(host.userNotifies.length).toBe(2);
+	expect(host.userNotifies[0]!.title).toBe("Peer message");
 
-		expect(outbox.receiptOf("unknown")).toBeUndefined();
+	// Unregistered (spoofed) receipts produce no state at all.
+	outbox.handleReceipt(statusFrame({ msg_id: "m-spoof", state: "held" }));
+	expect(outbox.receiptOf("m-spoof")).toBeUndefined();
+	expect(outbox.receiptOf("unknown")).toBeUndefined();
 	});
 
 	it("handleReceipt injects an agent notice for failed states with reason", () => {
@@ -715,6 +757,10 @@ describe("createPeerOutbox", () => {
 		};
 		const outbox = createPeerOutbox(deps);
 
+		outbox.registerOutbound("m-9");
+		outbox.registerOutbound("m-10");
+		outbox.registerOutbound("m-11");
+		outbox.registerOutbound("m-12");
 		outbox.handleReceipt(statusFrame({ msg_id: "m-9", state: "denied", reason: "rejected by user" }));
 		expect(outbox.receiptOf("m-9")).toBe("denied");
 		outbox.handleReceipt(statusFrame({ msg_id: "m-10", state: "dropped", reason: "rate-limited" }));
@@ -745,6 +791,7 @@ describe("createPeerOutbox", () => {
 			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
+		outbox.registerOutbound("m-13");
 		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
 		outbox.handleReceipt(statusFrame({ msg_id: "m-13", state: "denied", fromName: undefined, from }));
 		expect(host.notices).toEqual([`Peer message to ${from} (m-13) was denied.`]);
@@ -765,6 +812,7 @@ describe("createPeerOutbox", () => {
 			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
+		outbox.registerOutbound("m-old");
 		outbox.handleReceipt(statusFrame({ msg_id: "m-old", state: "held" }));
 		expect(outbox.receiptOf("m-old")).toBe("held");
 
@@ -864,9 +912,97 @@ describe("createPeerInbox", () => {
 		expect(status.state).toBe("delivered");
 	});
 
+	it("unwrapped content is dropped with a malformed-wrapper receipt", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+		const frame = userFrame({ rawContent: "hello from alpha" });
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.injected).toEqual([]);
+		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
+		expect(status.state).toBe("dropped");
+		expect(status.reason).toBe("malformed-wrapper");
+		expect(inbox.pendingCount()).toBe(0);
+	});
+
+	it("a tampered wrapper is dropped with a malformed-wrapper receipt", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+		// Round-trip fidelity: reordered attributes never parse.
+		const frame = userFrame({
+			rawContent: `<cross-session-message from-session="peer-session" from="pipe:LOCAL\\pi-peer-${"b".repeat(32)}">\nhello from alpha\n</cross-session-message>`,
+		});
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.injected).toEqual([]);
+		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
+		expect(status.state).toBe("dropped");
+		expect(status.reason).toBe("malformed-wrapper");
+	});
+
+	it("injected content is re-wrapped with the frame's wire identity", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "all" } });
+		const frame = userFrame({ body: "the payload" });
+
+		await inbox.handleFrame(frame, "peer");
+
+		// The agent sees the parsed body re-wrapped under OUR protocol, with
+		// the sender's wire identity — not the sender's wrapper bytes.
+		expect(host.injected).toEqual([
+			{
+				content: proto.wrapPeerContent(
+					{ from: frame.from, fromSession: frame.fromSession, fromName: "alpha" },
+					"the payload",
+				),
+				priority: frame.priority,
+			},
+		]);
+	});
+
+	it("injected wrapper sanitizes a hostile fromName", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "all" } });
+		// The raw fromName carries tag/quote characters; the injected wrapper's
+		// attribute value must be stripped of them.
+		const frame = userFrame({
+			fromName: 'alpha"><script>alert(1)</script>',
+			body: "the payload",
+		});
+
+		await inbox.handleFrame(frame, "peer");
+
+		const injected = host.injected[0]!.content;
+		// sanitizePeerText strips <>" outright, so no tag forging or quote
+		// escape remains in the attribute value.
+		const expected = "alphascriptalert(1)/script";
+		expect(injected).toBe(
+			proto.wrapPeerContent(
+				{ from: frame.from, fromSession: frame.fromSession, fromName: expected },
+				"the payload",
+			),
+		);
+		expect(injected).toContain(`from-name="${expected}"`);
+		expect(injected).not.toContain("<script");
+	});
+
+	it("guard queue-full drops with a truthful reason naming the cap", async () => {
+		const { inbox, host, guard, outbox } = makeInbox({
+			guard: { nextCheck: { ok: false, reason: "queue-full" } },
+		});
+		const frame = userFrame();
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.injected).toEqual([]);
+		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
+		expect(status.state).toBe("dropped");
+		expect(status.reason).toBe(
+			`queue-full: peer has accepted ${PEER_MAX_QUEUED_MESSAGES} messages since its last idle; retry after it goes idle`,
+		);
+	});
+
 	it("ask: held receipt first, then delivered after user says yes", async () => {
 		const { inbox, host, outbox } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
-		const frame = userFrame({ fromName: "alpha", content: "please review" });
+		const frame = userFrame({ fromName: "alpha", body: "please review" });
 
 		await inbox.handleFrame(frame, "peer");
 
@@ -882,7 +1018,7 @@ describe("createPeerInbox", () => {
 	it("ask: truncates the preview to 500 chars", async () => {
 		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
 		const long = "x".repeat(600);
-		await inbox.handleFrame(userFrame({ content: long }), "peer");
+		await inbox.handleFrame(userFrame({ body: long }), "peer");
 		const message = host.confirmCalls[0]!.message;
 		expect(message.length).toBe(501);
 		expect(message.startsWith("x".repeat(500))).toBe(true);
@@ -931,10 +1067,10 @@ describe("createPeerInbox", () => {
 		expect(status.reason).toContain("inject-failed");
 	});
 
-	it("queued count grows and is passed to the guard", async () => {
+	it("acceptedSinceIdle grows and is passed to the guard", async () => {
 		const { inbox, guard } = makeInbox({ host: { policy: "all" } });
 		await inbox.handleFrame(userFrame({ msg_id: "i1" }), "peer");
-		await inbox.handleFrame(userFrame({ msg_id: "i2", content: "second" }), "peer");
+		await inbox.handleFrame(userFrame({ msg_id: "i2", body: "second" }), "peer");
 		expect(inbox.pendingCount()).toBe(2);
 		expect(guard.checks.map((c) => c.queued)).toEqual([0, 1]);
 	});
@@ -1068,8 +1204,9 @@ describe("createPeerInbox", () => {
 		expect(outbox.controlCalls).toEqual([]);
 	});
 
-	it("a peer_idle_notice control frame surfaces as an agent notice", async () => {
-		const { inbox, host } = makeInbox({});
+	it("a peer_idle_notice with a valid nonce surfaces as an agent notice", async () => {
+		const { inbox, host, outbox } = makeInbox({});
+		outbox.registerIdleNonce("n-valid");
 		const frame: PeerControlFrame = {
 			msgV: 1,
 			msg_id: "notice-1",
@@ -1077,20 +1214,86 @@ describe("createPeerInbox", () => {
 			action: "peer_idle_notice",
 			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
 			fromName: "alpha",
+			nonce: "n-valid",
 		};
 		await inbox.handleFrame(frame, "peer");
 		expect(host.notices).toEqual(['Peer "alpha" is now idle.']);
 	});
 
-	it("peer_idle_notice without a name quotes the address", async () => {
+	it("peer_idle_notice without a nonce is dropped silently", async () => {
 		const { inbox, host } = makeInbox({});
-		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
 		const frame: PeerControlFrame = {
 			msgV: 1,
 			msg_id: "notice-2",
 			type: "control",
 			action: "peer_idle_notice",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+		await inbox.handleFrame(frame, "peer");
+		expect(host.notices).toEqual([]);
+	});
+
+	it("peer_idle_notice with an unknown nonce is dropped silently", async () => {
+		const { inbox, host, outbox } = makeInbox({});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "notice-3",
+			type: "control",
+			action: "peer_idle_notice",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+			nonce: "never-registered",
+		};
+		await inbox.handleFrame(frame, "peer");
+		expect(host.notices).toEqual([]);
+	});
+
+	it("a peer_idle_notice nonce is one-shot: a replay is dropped", async () => {
+		const { inbox, host, outbox } = makeInbox({});
+		outbox.registerIdleNonce("n-once");
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "notice-4",
+			type: "control",
+			action: "peer_idle_notice",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+			nonce: "n-once",
+		};
+		await inbox.handleFrame(frame, "peer");
+		await inbox.handleFrame({ ...frame, msg_id: "notice-5" }, "peer");
+		expect(host.notices).toEqual(['Peer "alpha" is now idle.']);
+	});
+
+	it("peer_idle_notice sanitizes a hostile name before the agent sees it", async () => {
+		const { inbox, host, outbox } = makeInbox({});
+		outbox.registerIdleNonce("n-hostile");
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "notice-hostile",
+			type: "control",
+			action: "peer_idle_notice",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: 'alpha"><script>alert(1)</script>',
+			nonce: "n-hostile",
+		};
+		await inbox.handleFrame(frame, "peer");
+		// Control characters and <>" never reach the notice text.
+		expect(host.notices).toEqual(['Peer "alphascriptalert(1)/script" is now idle.']);
+	});
+
+	it("peer_idle_notice without a name quotes the address", async () => {
+		const { inbox, host, outbox } = makeInbox({});
+		outbox.registerIdleNonce("n-addr");
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "notice-6",
+			type: "control",
+			action: "peer_idle_notice",
 			from,
+			nonce: "n-addr",
 		};
 		await inbox.handleFrame(frame, "peer");
 		expect(host.notices).toEqual([`Peer "${from}" is now idle.`]);

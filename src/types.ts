@@ -414,6 +414,13 @@ export interface PeerProtocol {
 	wrapPeerContent(attrs: PeerContentAttrs, body: string): string;
 	/** Parse wrapped content. Enforces round-trip fidelity (re-serializing attrs must reproduce the input). */
 	parsePeerContent(text: string): ParsedPeerContent | undefined;
+	/**
+	 * Sanitize a peer-supplied string before it enters agent/user-visible text
+	 * (notices, receipts, idle messages): strips C0/C1/DEL control chars and
+	 * <>" so a peer cannot smuggle fake wrapper tags or terminal escapes, and
+	 * caps length. Idempotent.
+	 */
+	sanitizePeerText(text: string, maxLen?: number): string;
 	/** Build the auth line (JSON + \n). */
 	buildAuthLine(token: string): string;
 	/** Extract the token from an auth line, or undefined when malformed. */
@@ -578,6 +585,20 @@ export interface PeerOutbox {
 	receiptOf(msgId: string): PeerReceiptState | undefined;
 	/** Handle an inbound peer_message_status frame. */
 	handleReceipt(frame: PeerMessageStatusFrame): void;
+	/**
+	 * Record a msg_id this session actually sent (called by send()). Receipts
+	 * for unknown msg_ids are spoofed traffic and must be ignored.
+	 */
+	registerOutbound(msgId: string): void;
+	/** Whether msg_id belongs to a message this session sent. */
+	expectsReceipt(msgId: string): boolean;
+	/** Register an outstanding notify_when_idle subscription nonce (send with notifyWhenIdle). */
+	registerIdleNonce(nonce: string): void;
+	/**
+	 * Validate + consume an inbound peer_idle_notice nonce (one-shot). Returns
+	 * false for unknown/reused/missing nonces — those notices are dropped.
+	 */
+	consumeIdleNonce(nonce: string | undefined): boolean;
 }
 
 /** inbox.ts */

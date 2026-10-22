@@ -20,7 +20,8 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import peersExtension, { computeProjectRoot } from "../src/index.ts";
-import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE, type PeersExtensionContext, type PeersHostAPI, type PeerRecord } from "../src/types.ts";
+import { createPeerProtocol } from "../src/protocol.ts";
+import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE, type PeerContentAttrs, type PeersExtensionContext, type PeersHostAPI, type PeerRecord } from "../src/types.ts";
 
 interface RegisteredTool {
 	name: string;
@@ -304,6 +305,8 @@ describe("peers plugin wiring (dual-host)", () => {
 		const keyName = readdirSync(peersDir).find((f) => PEER_KEY_FILE_RE.test(f));
 		const key = JSON.parse(readFileSync(join(peersDir, keyName!), "utf8")) as { peerToken: string };
 
+		const wireFrom = "pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc";
+		const wireAttrs: PeerContentAttrs = { from: wireFrom, fromSession: "sess-test", fromName: "test-peer" };
 		const deliver = (text: string): Promise<void> => {
 			const { promise, resolve, reject } = Promise.withResolvers<void>();
 			const sock = createConnection(socketPath, () => {
@@ -313,12 +316,12 @@ describe("peers plugin wiring (dual-host)", () => {
 						msgV: 1,
 						msg_id: randomUUID(),
 						type: "user",
-						from: "pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc",
+						from: wireFrom,
 						fromPid: 4242,
 						fromSession: "sess-test",
 						fromName: "test-peer",
-						hopChain: ["pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc"],
-						content: `<cross-session-message from="pipe:LOCAL\\pi-peer-cccccccccccccccccccccccccccccccc">${text}</cross-session-message>`,
+						hopChain: [wireFrom],
+						content: createPeerProtocol().wrapPeerContent(wireAttrs, text),
 						priority: "next",
 					})}\n`,
 				);

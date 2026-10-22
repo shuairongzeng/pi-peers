@@ -60,11 +60,67 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			}
 		}
 	}
+	/**
+	 * msg_ids this session actually sent (value: ms epoch when sent). Receipts
+	 * for anything else are spoofed traffic, ignored with no state change.
+	 */
+	const outbound = new Map<string, number>();
+	/** Outstanding notify_when_idle subscription nonces we generated (value: ms epoch). */
+	const idleNonces = new Map<string, number>();
+
+	/** Prune TTL-expired tracked ids alongside receipts (same window). */
+	function pruneTracked(): void {
+		const cutoff = Date.now() - PEER_RECEIPT_TTL_MS;
+		for (const [msgId, sentAt] of outbound) {
+			if (sentAt < cutoff) {
+				outbound.delete(msgId);
+			}
+		}
+		for (const [nonce, sentAt] of idleNonces) {
+			if (sentAt < cutoff) {
+				idleNonces.delete(nonce);
+			}
+		}
+	}
+
+	/**
+	 * Record a msg_id this session actually sent (called by send() after a
+	 * successful deliver); only these ids may produce receipt state.
+	 */
+	function registerOutbound(msgId: string): void {
+		pruneTracked();
+		outbound.set(msgId, Date.now());
+	}
+
+	/** Whether msg_id belongs to a message this session sent. */
+	function expectsReceipt(msgId: string): boolean {
+		pruneTracked();
+		return outbound.has(msgId);
+	}
+
+	/** Register an outstanding notify_when_idle subscription nonce. */
+	function registerIdleNonce(nonce: string): void {
+		pruneTracked();
+		idleNonces.set(nonce, Date.now());
+	}
+
+	/**
+	 * Validate + consume an inbound idle-notice nonce (one-shot). Unknown,
+	 * reused, or missing nonces return false — those notices are dropped.
+	 */
+	function consumeIdleNonce(nonce: string | undefined): boolean {
+		if (nonce === undefined) {
+			return false;
+		}
+		return idleNonces.delete(nonce);
+	}
+
 
 	/**
 	 * Open a connection, write the auth line plus each given serialized frame,
-	 * then end the outbound side. Applies the sender-paced pacer around the
-	 * attempt: any connect/write/end failure refunds the consumed token.
+	 * then end the outbound side. Never touches the pacer: only send() consumes
+	 * a token, so only send()'s catch path refunds one — a failed control
+	 * delivery (which consumed nothing) must not inflate the bucket.
 	 */
 	async function deliver(target: string, socketPath: string, token: string, lines: string[]): Promise<void> {
 		// Registry records store the connect path; transport.connect takes the
@@ -82,7 +138,6 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			}
 			await conn.end();
 		} catch (error) {
-			pacer.refund(target);
 			conn?.destroy();
 			if (error instanceof PeerSendError) {
 				throw error;
@@ -102,15 +157,17 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 
 		const resolution = registry.resolve(target);
 		if (resolution.kind === "none") {
-			const live = registry
-				.list()
-				.filter((entry) => entry.live)
-				.map((entry) => `${entry.record.name} [${registry.refOf(entry.record)}]`);
-			const peersList = live.length > 0 ? live.join("\n") : "(no live peers)";
+			// Scope decision: the outbox resolves against the full live registry
+			// and has no notion of the caller's project scope (that lives in
+			// tool.ts, which layers scoping on top via findCrossProjectTarget).
+			// Embedding the machine-wide peer list here would leak other
+			// projects' session names into this project's errors, so the error
+			// carries no list; tool.ts's describeSendError renders the scoped
+			// candidates (it knows the scope).
 			throw new PeerSendError(
 				"not_found",
 				`no live peer matches "${target}": the peer may not be running or may have exited. ` +
-					`Socket addresses change on every start, so never reuse a stale address. Live peers:\n${peersList}`,
+					`Socket addresses change on every start, so never reuse a stale address`,
 			);
 		}
 		if (resolution.kind === "ambiguous") {
@@ -161,9 +218,12 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		};
 
 		const lines: string[] = [];
+		/** Nonce of this send's notify_when_idle subscription, when requested. */
+		let notifyNonce: string | undefined;
 		if (opts.notifyWhenIdle === true) {
 			// The subscription precedes the message: it must cover the work this
 			// message triggers, and the peer processes lines in order.
+			notifyNonce = randomUUID();
 			const notifyFrame: PeerControlFrame = {
 				...protocol.newEnvelope(),
 				type: "control",
@@ -171,13 +231,25 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 				reply_to: identity.socketAddress,
 				from: identity.socketAddress,
 				...(identity.name !== undefined && identity.name !== "" ? { fromName: identity.name } : {}),
-				nonce: randomUUID(),
+				nonce: notifyNonce,
 			};
 			lines.push(protocol.serializeFrame(notifyFrame));
 		}
 		lines.push(protocol.serializeFrame(frame));
-
-		await deliver(target, record.socketPath, tokenForPath(record.socketPath) ?? key.peerToken, lines);
+		try {
+			await deliver(target, record.socketPath, tokenForPath(record.socketPath) ?? key.peerToken, lines);
+		} catch (error) {
+			// Only send() consumed a pacer token, so only this path refunds it.
+			pacer.refund(target);
+			throw error;
+		}
+		// Registered only after a successful deliver: a receipt for a msg_id
+		// (or an idle notice for a nonce) that never made it onto the wire is
+		// spoofed traffic.
+		registerOutbound(frame.msg_id);
+		if (notifyNonce !== undefined) {
+			registerIdleNonce(notifyNonce);
+		}
 
 		return { msgId: frame.msg_id, to: record.socketPath, toName: record.name };
 	}
@@ -218,6 +290,12 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 	}
 
 	function handleReceipt(frame: PeerMessageStatusFrame): void {
+		// Authenticity gate: only receipts for msg_ids this session actually
+		// sent may produce state or notices. Anything else is spoofed traffic
+		// and is ignored entirely (no store, no injectAgentNotice).
+		if (!expectsReceipt(frame.msg_id)) {
+			return;
+		}
 		pruneReceipts();
 		receipts.set(frame.msg_id, { state: frame.state, at: Date.now() });
 		const sender = frame.fromName ?? frame.from;
@@ -244,5 +322,14 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		return receipts.get(msgId)?.state;
 	}
 
-	return { send, sendControl, handleReceipt, receiptOf };
+	return {
+		send,
+		sendControl,
+		handleReceipt,
+		receiptOf,
+		registerOutbound,
+		expectsReceipt,
+		registerIdleNonce,
+		consumeIdleNonce,
+	};
 }

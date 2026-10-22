@@ -84,6 +84,56 @@ describe("createPeerGuard", () => {
 		});
 	});
 
+	describe("global rate bucket", () => {
+		it("drops the 121st accepted frame in a burst from rotating senders", () => {
+			const guard = createPeerGuard({ now });
+			// 120 rotating senders, each with a fresh per-sender bucket: only the aggregate cap stops them.
+			for (let i = 0; i < 120; i++) {
+				const sender = `s${i}`;
+				expect(guard.check(sender, makeFrame({ fromSession: sender, content: `m${i}` }), "self", 0)).toEqual({
+					ok: true,
+				});
+				guard.recordAccepted(sender, makeFrame({ fromSession: sender, content: `m${i}` }));
+			}
+			expect(guard.check("s120", makeFrame({ fromSession: "s120", content: "next" }), "self", 0)).toEqual({
+				ok: false,
+				reason: "rate-limited",
+			});
+			// A brand-new sender with an untouched per-sender bucket is still blocked.
+			expect(guard.check("fresh-rotate", makeFrame({ content: "fresh" }), "self", 0)).toEqual({
+				ok: false,
+				reason: "rate-limited",
+			});
+		});
+
+		it("refills over time (aggregate refill, prorated per ms)", () => {
+			const guard = createPeerGuard({ now });
+			for (let i = 0; i < 120; i++) {
+				guard.recordAccepted(`s${i}`, makeFrame({ fromSession: `s${i}`, content: `m${i}` }));
+			}
+			expect(guard.check("any", makeFrame({ content: "next" }), "self", 0).reason).toBe("rate-limited");
+			// Default aggregate refill: 2 tokens/sec → 1 token needs 500ms.
+			clock += MS_PER_TOKEN(2);
+			expect(guard.check("any", makeFrame({ content: "next" }), "self", 0)).toEqual({ ok: true });
+			// The single refilled token is only lending capacity; it is consumed by acceptance.
+			guard.recordAccepted("any", makeFrame({ content: "next" }));
+			expect(guard.check("any", makeFrame({ content: "later" }), "self", 0).reason).toBe("rate-limited");
+		});
+
+		it("per-sender limit still applies when the global bucket is full", () => {
+			const guard = createPeerGuard({ now, rateCapacity: 2 });
+			guard.recordAccepted("s1", makeFrame({ content: "a" }));
+			guard.recordAccepted("s1", makeFrame({ content: "b" }));
+			// Global bucket has 118 tokens left; the per-sender cap still refuses s1.
+			expect(guard.check("s1", makeFrame({ content: "c" }), "self", 0)).toEqual({
+				ok: false,
+				reason: "rate-limited",
+			});
+			// Another sender is unaffected.
+			expect(guard.check("s2", makeFrame({ content: "c" }), "self", 0)).toEqual({ ok: true });
+		});
+	});
+
 	describe("dedup window", () => {
 		it("rejects a same-content resend within the window", () => {
 			const guard = createPeerGuard({ now });

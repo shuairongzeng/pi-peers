@@ -200,10 +200,19 @@ function findCrossProjectTarget(deps: PeerToolDeps, target: string, selfCwd: str
 	return undefined;
 }
 
-function describeSendError(error: PeerSendError, registry: PeerRegistry, selfPid: number): string {
+function describeSendError(
+	error: PeerSendError,
+	registry: PeerRegistry,
+	selfPid: number,
+	scope: "project" | "all",
+	selfCwd: string,
+): string {
 	switch (error.code) {
 		case "not_found":
-			return `No live peer matches "${error.message}". Run /peers to see live sessions.\nLive peers:\n${listLivePeers(registry, selfPid, "all", "")}`;
+			// The listing uses the send's own scope: same-project peers only
+			// under the default, so an error in one project never leaks the
+			// names/refs of sessions in other projects.
+			return `No live peer matches "${error.message}". Run /peers to see live sessions.\nLive peers:\n${listLivePeers(registry, selfPid, scope, selfCwd)}`;
 		case "ambiguous": {
 			const candidates = error.candidates.length > 0 ? error.candidates : ["(no candidates)"];
 			return `Several live peers match. Resend with "name [ref]" to disambiguate:\n${candidates.join("\n")}`;
@@ -211,7 +220,7 @@ function describeSendError(error: PeerSendError, registry: PeerRegistry, selfPid
 		case "offline":
 			return `Peer is offline (process dead or unreachable): ${error.message}. The peer may have exited; run /peers to refresh the list.`;
 		case "no_key":
-			return `No auth key for the peer (key file missing): ${error.message}. The peer may have restarted since it registered; ask its user to restart or check ~/.pi/agent/peers/.`;
+			return `No auth key for the peer (key file missing): ${error.message}. The peer may have restarted since it registered; retry, or ask its user to restart the session.`;
 		case "no_live_inbox":
 			return `No live inbox for the target (registry/key missing and endpoint unverifiable): ${error.message}. Run /peers to refresh the list.`;
 		case "connect_failed":
@@ -223,6 +232,12 @@ function describeSendError(error: PeerSendError, registry: PeerRegistry, selfPid
 		case "sender_paced":
 			return `Local pacing predicts the peer would drop this send (too many recent messages): ${error.message}. Wait a moment, merge messages, and retry.`;
 		case "invalid_target":
+			// Cross-project refusals come from findCrossProjectTarget, whose
+			// message names the other project. types.ts is frozen (no structured
+			// hint field), so the marker is the message text itself.
+			if (error.message.includes("belongs to another project")) {
+				return `Invalid target: ${error.message}. Resend with scope: "all" (only if the user asked to reach that session).`;
+			}
 			return `Invalid target: ${error.message}. Use a peer name from /peers, or "name [ref]" to disambiguate.`;
 	}
 }
@@ -340,7 +355,7 @@ async function runShutdownAction(
 	const resolved = resolveShutdownTarget(deps, target, scope, ctx.cwd);
 	if (resolved instanceof PeerSendError) {
 		return {
-			content: [{ type: "text", text: describeSendError(resolved, deps.registry, deps.identity.pid) }],
+			content: [{ type: "text", text: describeSendError(resolved, deps.registry, deps.identity.pid, scope, ctx.cwd) }],
 			details: {},
 			isError: true,
 		};
@@ -361,7 +376,7 @@ async function runShutdownAction(
 	} catch (error) {
 		if (error instanceof PeerSendError) {
 			return {
-				content: [{ type: "text", text: describeSendError(error, deps.registry, deps.identity.pid) }],
+				content: [{ type: "text", text: describeSendError(error, deps.registry, deps.identity.pid, scope, ctx.cwd) }],
 				details: {},
 				isError: true,
 			};
@@ -445,7 +460,7 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 						content: [
 							{
 								type: "text",
-								text: describeSendError(attempted.error, deps.registry, deps.identity.pid),
+								text: describeSendError(attempted.error, deps.registry, deps.identity.pid, scope, ctx.cwd),
 							},
 						],
 						details: {},

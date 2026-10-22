@@ -312,6 +312,58 @@ describe("createPeerProtocol", () => {
 		});
 	});
 
+	describe("sanitizePeerText", () => {
+		it("strips ANSI escapes, C0/C1/DEL controls, quotes, and angle brackets", () => {
+			expect(protocol.sanitizePeerText("\u001b[31mred\u001b[0m")).toBe("[31mred[0m");
+			expect(protocol.sanitizePeerText("a\u0000b\u0001c")).toBe("abc");
+			expect(protocol.sanitizePeerText("a\u007fb")).toBe("ab");
+			expect(protocol.sanitizePeerText("a\u0092b")).toBe("ab");
+			expect(protocol.sanitizePeerText('say "hi" now')).toBe("say hi now");
+			expect(protocol.sanitizePeerText("<script>alert</script>")).toBe("scriptalert/script");
+		});
+
+		it("collapses newlines and whitespace runs to a single space and trims", () => {
+			expect(protocol.sanitizePeerText("line1\nline2")).toBe("line1 line2");
+			expect(protocol.sanitizePeerText("line1\r\n\r\nline2")).toBe("line1 line2");
+			expect(protocol.sanitizePeerText("a  \u0003  b")).toBe("a b");
+			expect(protocol.sanitizePeerText("   padded   ")).toBe("padded");
+		});
+
+		it("leaves normal CJK/unicode text untouched", () => {
+			expect(protocol.sanitizePeerText("会議は15時に開始")).toBe("会議は15時に開始");
+			expect(protocol.sanitizePeerText("進捗どうですか？ ok")).toBe("進捗どうですか？ ok");
+			expect(protocol.sanitizePeerText("定期同期 🚀 完了")).toBe("定期同期 🚀 完了");
+		});
+
+		it("caps at the default 120 chars, ellipsis counted within the cap", () => {
+			const result = protocol.sanitizePeerText("a".repeat(200));
+			expect(result).toBe(`${"a".repeat(119)}…`);
+			expect(result.length).toBe(120);
+		});
+
+		it("caps at a custom maxLen and leaves exact fits untouched", () => {
+			expect(protocol.sanitizePeerText("0123456789", 5)).toBe("0123…");
+			expect(protocol.sanitizePeerText("abc", 3)).toBe("abc");
+			expect(protocol.sanitizePeerText("abcd", 3)).toBe("ab…");
+		});
+
+		it("is idempotent, including truncated results", () => {
+			const samples = [
+				"\u001b[31mred\u001b[0m",
+				"line1\n\nline2 <b> \"q\"",
+				"a\u007f\u0092\u0000b",
+				"a".repeat(200),
+				"会議は15時に開始",
+				"",
+				"  \u000b spaced \t out \n",
+			];
+			for (const sample of samples) {
+				const once = protocol.sanitizePeerText(sample);
+				expect(protocol.sanitizePeerText(once)).toBe(once);
+			}
+		});
+	});
+
 	describe("parsePeerContent malformed input", () => {
 		const goodText = protocol.wrapPeerContent(
 			{ from: "f1", fromSession: "s1", fromName: "n1", hopChain: ["t1", "t2"] },

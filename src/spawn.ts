@@ -95,6 +95,9 @@ function buildChildEnv(opts: PeerSpawnOptions, name: string): NodeJS.ProcessEnv 
 	// hand it our socket credentials (those mark it as our child).
 	delete env[ENV_PEERS_SOCKET];
 	delete env[ENV_PEERS_TOKEN];
+	// Same reasoning: an ephemeral parent spawning a persistent helper must not
+	// pass its own self-destruct flag down.
+	delete env[ENV_PEERS_EPHEMERAL];
 	env[ENV_PEERS_NAME] = name;
 	if (opts.ephemeral === true) env[ENV_PEERS_EPHEMERAL] = "1";
 	return env;

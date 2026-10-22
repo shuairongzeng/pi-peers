@@ -82,6 +82,10 @@ function makeOutbox(
 		},
 		receiptOf: () => undefined,
 		handleReceipt: () => {},
+		registerOutbound: () => {},
+		expectsReceipt: () => false,
+		registerIdleNonce: () => {},
+		consumeIdleNonce: () => false,
 		controlCalls,
 	};
 }
@@ -504,9 +508,21 @@ describe("createPeerMessageTool error mapping", () => {
 		return textOf(result);
 	}
 
-	it("not_found lists the live peers", async () => {
+	it("not_found lists only same-project live peers under the default scope", async () => {
 		const text = await errorText(new PeerSendError("not_found", "alpha"));
 		expect(text).toContain("No live peer matches");
+		expect(text).toContain("alpha");
+		// beta lives in another project: a scoped error must not leak its name.
+		expect(text).not.toContain("beta");
+		expect(text).toContain("(+1 in other projects)");
+	});
+
+	it("not_found with scope:all lists every live peer", async () => {
+		const outbox = makeOutbox(() =>
+			Promise.reject(new PeerSendError("not_found", 'no live peer matches "alpha"')),
+		);
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: liveEntries }));
+		const text = textOf(await runTool(tool, { to: "alpha", message: "hi", scope: "all" }, "D:/work/alpha"));
 		expect(text).toContain("alpha");
 		expect(text).toContain("beta");
 	});
@@ -537,6 +553,33 @@ describe("createPeerMessageTool error mapping", () => {
 			expect(text.length, `code ${code} produced empty text`).toBeGreaterThan(0);
 			expect(text).toContain(needle);
 		}
+	});
+
+	it("invalid_target for a cross-project refusal tells the user to widen scope", async () => {
+		const text = await errorText(
+			new PeerSendError(
+				"invalid_target",
+				'target "beta" belongs to another project (D:/work/beta); pass scope: "all" to message across projects',
+			),
+		);
+		expect(text).toContain('Resend with scope: "all" (only if the user asked to reach that session).');
+		expect(text).not.toContain("Use a peer name from /peers");
+	});
+
+	it("invalid_target for other causes keeps the /peers guidance", async () => {
+		const text = await errorText(new PeerSendError("invalid_target", "unrecognized peer socket path: bad"));
+		expect(text).toContain('Use a peer name from /peers, or "name [ref]" to disambiguate.');
+		expect(text).not.toContain("only if the user asked");
+	});
+
+	it("no_key text points at a peer restart, not a wrong path", async () => {
+		const text = await errorText(
+			new PeerSendError("no_key", 'no auth key for peer "alpha" at path: has not published a key'),
+		);
+		expect(text).toContain(
+			"The peer may have restarted since it registered; retry, or ask its user to restart the session.",
+		);
+		expect(text).not.toContain("~/.pi/agent/peers/");
 	});
 
 	it("rethrows non-PeerSendError exceptions", async () => {

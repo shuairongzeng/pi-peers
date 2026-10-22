@@ -5,6 +5,10 @@
  * no dedup fingerprint is recorded until recordAccepted() runs. refund() hands one token back
  * when a message that consumed one ultimately fails to deliver.
  *
+ * A global token bucket caps the aggregate inbound flow: every accepted user frame consumes one
+ * token from it regardless of sender, so rotating the attacker-controlled `from` string can't
+ * hand each message a fresh per-sender bucket. Dedup stays per-sender.
+ *
  * Per-sender state (token bucket + dedup fingerprints) is LRU-capped at
  * PEER_MAX_TRACKED_SENDERS: when a new sender arrives over the cap, the least recently used
  * sender is evicted with all its state, so a returning sender starts fresh.
@@ -22,6 +26,11 @@ import {
 	PEER_RATE_REFILL_PER_SEC,
 } from "./types.ts";
 
+/** Aggregate inbound cap: tokens shared by ALL senders' accepted user frames. */
+export const PEER_GLOBAL_RATE_CAPACITY = 120;
+/** Aggregate inbound refill (tokens/sec), prorated per elapsed millisecond. */
+export const PEER_GLOBAL_RATE_REFILL_PER_SEC = 2;
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -30,10 +39,14 @@ import {
 export interface PeerGuardOptions {
 	/** Milliseconds since the epoch. Defaults to Date.now. */
 	now?: () => number;
-	/** Bucket capacity. Defaults to PEER_RATE_CAPACITY. */
+	/** Per-sender bucket capacity. Defaults to PEER_RATE_CAPACITY. */
 	rateCapacity?: number;
 	/** Tokens added per second, prorated per elapsed millisecond. Defaults to PEER_RATE_REFILL_PER_SEC. */
 	rateRefillPerSec?: number;
+	/** Aggregate bucket capacity across all senders. Defaults to PEER_GLOBAL_RATE_CAPACITY. */
+	globalRateCapacity?: number;
+	/** Aggregate refill (tokens/sec) shared by all senders. Defaults to PEER_GLOBAL_RATE_REFILL_PER_SEC. */
+	globalRateRefillPerSec?: number;
 	/** How long a content fingerprint suppresses re-delivery. Defaults to PEER_DEDUP_WINDOW_MS. */
 	dedupWindowMs?: number;
 	/** Max occurrences of our own hop token in a hopChain. Defaults to PEER_MAX_SELF_HOPS. */
@@ -88,9 +101,14 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 	const maxHopChain = opts.maxHopChain ?? PEER_MAX_HOP_CHAIN;
 	const maxQueued = opts.maxQueued ?? PEER_MAX_QUEUED_MESSAGES;
 	const maxTrackedSenders = opts.maxTrackedSenders ?? PEER_MAX_TRACKED_SENDERS;
+	const globalRateCapacity = opts.globalRateCapacity ?? PEER_GLOBAL_RATE_CAPACITY;
+	const globalRateRefillPerSec = opts.globalRateRefillPerSec ?? PEER_GLOBAL_RATE_REFILL_PER_SEC;
 
 	/** Insertion-ordered; first key = least recently used, re-inserting a key refreshes recency. */
 	const senders = new Map<string, SenderState>();
+
+	/** Aggregate bucket consumed by every accepted user frame, regardless of sender. */
+	const globalBucket: TokenBucket = { tokens: globalRateCapacity, lastRefillMs: now() };
 
 	function check(fromKey: string, frame: PeerUserFrame, ownHopToken: string, queuedCount: number): PeerGuardCheck {
 		if (queuedCount >= maxQueued) {
@@ -121,6 +139,10 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 			// A fresh sender starts with a full bucket; capacity under one can never admit a message.
 			return { ok: false, reason: "rate-limited" };
 		}
+		if (tokensAt(globalBucket, atMs, globalRateCapacity, globalRateRefillPerSec) < 1) {
+			// Aggregate cap: rotating `from` cannot hand each message a fresh bucket.
+			return { ok: false, reason: "rate-limited" };
+		}
 		return { ok: true };
 	}
 
@@ -145,6 +167,8 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 		}
 		state.bucket.tokens = Math.max(0, tokensAt(state.bucket, atMs, rateCapacity, rateRefillPerSec) - 1);
 		state.bucket.lastRefillMs = atMs;
+		globalBucket.tokens = Math.max(0, tokensAt(globalBucket, atMs, globalRateCapacity, globalRateRefillPerSec) - 1);
+		globalBucket.lastRefillMs = atMs;
 		state.seen.set(fingerprint, atMs);
 	}
 
@@ -154,6 +178,11 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 		const atMs = now();
 		state.bucket.tokens = Math.min(rateCapacity, tokensAt(state.bucket, atMs, rateCapacity, rateRefillPerSec) + 1);
 		state.bucket.lastRefillMs = atMs;
+		globalBucket.tokens = Math.min(
+			globalRateCapacity,
+			tokensAt(globalBucket, atMs, globalRateCapacity, globalRateRefillPerSec) + 1,
+		);
+		globalBucket.lastRefillMs = atMs;
 	}
 
 	return { check, recordAccepted, refund };

@@ -146,6 +146,29 @@ function parsePeerContent(text: string): ParsedPeerContent | undefined {
 }
 
 // ---------------------------------------------------------------------------
+// Peer-supplied text sanitization (notices, receipts, idle messages)
+// ---------------------------------------------------------------------------
+
+/**
+ * Stripped outright from peer text: C0 controls other than the ASCII whitespace collapsed
+ * below, DEL, C1 controls, and `<>`/`"` which could forge wrapper tags or break out of a
+ * quoted attribute value.
+ */
+const UNSAFE_TEXT_CHARS_RE = /[\u0000-\u0008\u000e-\u001f\u007f-\u009f<>"]/g;
+
+/** Runs of ASCII whitespace (spaces, tabs, newlines — including runs the stripping reveals) collapse to a single space. */
+const TEXT_WHITESPACE_RUN_RE = /[\t\n\v\f\r ]+/g;
+
+function sanitizePeerText(text: string, maxLen = 120): string {
+	const safe = text
+		.replace(UNSAFE_TEXT_CHARS_RE, "")
+		.replace(TEXT_WHITESPACE_RUN_RE, " ")
+		.trim();
+	if (safe.length <= maxLen) return safe;
+	return safe.slice(0, Math.max(0, maxLen - 1)) + "…";
+}
+
+// ---------------------------------------------------------------------------
 // Wire frames (newline-delimited JSON)
 // ---------------------------------------------------------------------------
 
@@ -305,6 +328,7 @@ export function createPeerProtocol(): PeerProtocol {
 		parseFrameLine,
 		wrapPeerContent,
 		parsePeerContent,
+		sanitizePeerText,
 		buildAuthLine,
 		parseAuthLine,
 	};
