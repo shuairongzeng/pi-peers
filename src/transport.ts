@@ -341,7 +341,12 @@ function createConnection(socket: Socket, queue: LineQueue | undefined, macosClo
 				return;
 			}
 			await new Promise<void>((resolve) => {
-				state.socket.end(() => resolve());
+				state.socket.end((error?: Error | null) => {
+					if (error) {
+						console.error(`[pi-peers] connection end failed: ${String(error)}`);
+					}
+					resolve();
+				});
 				state.socket.once("close", () => resolve());
 			});
 		},
@@ -525,7 +530,14 @@ async function connect(address: string, options?: PeerConnectOptions): Promise<P
 			}
 			settled = true;
 			clearTimeout(timeoutHandle);
+			// The once-handler above only covers the connect phase. Once it is
+			// detached, an error emitted before createConnection's framing
+			// attaches its own handler (the await gap below) would crash the
+			// process; keep a permanent logging handler on the socket instead.
 			sock.off("error", onError);
+			sock.on("error", (error: Error) => {
+				console.error(`[pi-peers] socket error on ${address}: ${String(error)}`);
+			});
 			resolve(sock);
 		});
 	});

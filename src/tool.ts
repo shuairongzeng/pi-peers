@@ -451,11 +451,14 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 				const attempted = await attemptSend(deps, params.to, params.message, sendOpts, scope, ctx.cwd);
 				if (attempted.ok) {
 					const target = attempted.outcome.toName ? `"${attempted.outcome.toName}"` : "peer";
+					const notifyNote = attempted.outcome.notifyIdleUnsupported === true
+						? " NOTE: the peer's plugin version does not support idle notification — you will NOT be pinged; poll with list instead."
+						: "";
 					return {
 						content: [
 							{
 								type: "text",
-								text: `Sent to ${target} [${attempted.outcome.to}] (msg_id ${attempted.outcome.msgId}). Receipt will follow asynchronously.`,
+								text: `Sent to ${target} [${attempted.outcome.to}] (msg_id ${attempted.outcome.msgId}). Receipt will follow asynchronously.${notifyNote}`,
 							},
 						],
 						details: {},

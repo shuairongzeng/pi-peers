@@ -273,6 +273,21 @@ describe("normalizeName", () => {
 		freshRegistry();
 		expect(registry.normalizeName("   ")).toBe("");
 	});
+
+	it("strips C0/C1/DEL control characters", () => {
+		freshRegistry();
+		// ESC is not whitespace, so it survives trim/dash-collapse and must be
+		// removed here; the digits and brackets around it are untouched.
+		expect(registry.normalizeName("proj\u001b[31mx")).toBe("proj[31mx");
+		// NUL, BEL, DEL, and C1 (U+009F) are removed mid-string too.
+		expect(registry.normalizeName("a\u0000b\u0007c\u007fd\u009fe")).toBe("abcde");
+	});
+
+	it("falls back to 'unnamed' when stripping empties the name", () => {
+		freshRegistry();
+		expect(registry.normalizeName("\u001b")).toBe("unnamed");
+		expect(registry.normalizeName("\u0007\u007f")).toBe("unnamed");
+	});
 });
 
 describe("refOf", () => {

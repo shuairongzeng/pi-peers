@@ -3,7 +3,7 @@ import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:
 import { connect as netConnect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createPeerAuth } from "../src/auth.ts";
 import {
 	addressFromPath,
@@ -420,6 +420,40 @@ describe("transport round trip", () => {
 			echoed.push(line);
 		}
 		expect(echoed).toEqual(["aa", "bb"]);
+	});
+
+	it("logs a console.error and still resolves when end()'s flush fails", async () => {
+		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			// Server-side connection that never drains: it accepts the auth
+			// line, then destroys itself while the client's big line is still
+			// flushing, so socket.end()'s callback receives the flush error.
+			let serverConn: PeerConnection | undefined;
+			const { server, first } = await startServer((conn) => {
+				serverConn = conn;
+			});
+
+			const client = await transport.connect(server.address.address);
+			client.writeLine("auth");
+			// The auth line must have been consumed before we break the pipe.
+			const recorded = await first;
+			expect(recorded.firstLine).toBe("auth");
+
+			client.writeLine(`x${"a".repeat(600 * 1024)}`);
+			const ending = client.end();
+			serverConn?.destroy();
+			// Best-effort semantics: end() resolves even when the flush failed.
+			await ending;
+
+			const logged = consoleError.mock.calls
+				.flat()
+				.map((part) => String(part))
+				.join("\n");
+			expect(logged).toContain("[pi-peers]");
+			expect(logged).toContain("end failed");
+		} finally {
+			consoleError.mockRestore();
+		}
 	});
 
 	it("readLines rejects connections from another transport factory", () => {

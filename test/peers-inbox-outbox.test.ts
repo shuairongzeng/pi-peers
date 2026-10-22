@@ -249,7 +249,7 @@ function entry(rec: Partial<PeerRecord> = {}, live = true): PeerRegistryEntry {
 			pidDomain: "win32:box",
 			socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"a".repeat(32)}`,
 			peerProtocol: 1,
-			features: [],
+			features: ["notify_idle"],
 			...rec,
 		},
 		live,

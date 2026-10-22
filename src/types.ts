@@ -410,6 +410,8 @@ export interface PeerSendOutcome {
 	to: string;
 	/** Name of the peer at send time, when known. */
 	toName?: string;
+	/** True when notifyWhenIdle was requested but the peer doesn't advertise the feature. */
+	notifyIdleUnsupported?: boolean;
 }
 
 // ---------------------------------------------------------------------------

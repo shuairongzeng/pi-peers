@@ -162,7 +162,7 @@ function entry(rec: Partial<PeerRegistryEntry["record"]> = {}, live = true): Pee
 			pidDomain: "win32:box",
 			socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"a".repeat(32)}`,
 			peerProtocol: 1,
-			features: [],
+			features: ["notify_idle"],
 			...rec,
 		},
 		live,
@@ -372,5 +372,19 @@ describe("createPeerOutbox idle nonces", () => {
 		expect(frame.action).toBeUndefined();
 		// The only line pair is auth + user frame; no nonce to consume.
 		expect(outbox.consumeIdleNonce(frame.nonce ?? "none")).toBe(false);
+	});
+
+	it("skips the idle subscription and flags the outcome when the peer lacks notify_idle", async () => {
+		// Simulate an older plugin: record without the notify_idle feature.
+		const legacyEntry = entry({ features: [] });
+		const deps = makeDeps({ registry: makeRegistry(() => ({ kind: "unique", entry: legacyEntry })) });
+		const outbox = createPeerOutbox(deps);
+		const transport = deps.transport as FakeTransport;
+
+		const outcome = await outbox.send("alpha", "ping", { notifyWhenIdle: true });
+
+		// auth + user frame only — no subscription line on the wire.
+		expect(transport.sessions[0]!.lines).toHaveLength(2);
+		expect(outcome.notifyIdleUnsupported).toBe(true);
 	});
 });

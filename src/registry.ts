@@ -110,9 +110,16 @@ function atomicWriteFileSync(path: string, data: string): void {
 // Name handling
 // ---------------------------------------------------------------------------
 
-/** NFKC → trim → lowercase → collapse whitespace runs into single dashes. */
+/**
+ * NFKC → trim → lowercase → collapse whitespace runs into single dashes →
+ * strip C0/C1/DEL control chars. Names derive from basename(cwd) and peer
+ * renames, so control chars must never reach terminal-rendered output.
+ * Stripping that empties a non-empty name falls back to "unnamed".
+ */
 function normalizeName(name: string): string {
-	return name.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, "-");
+	const normalized = name.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, "-");
+	const stripped = normalized.replace(/[\x00-\x1f\x7f-\x9f]/g, "");
+	return stripped === "" && normalized !== "" ? "unnamed" : stripped;
 }
 
 // ---------------------------------------------------------------------------

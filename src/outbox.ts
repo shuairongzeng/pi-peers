@@ -11,6 +11,7 @@
 
 import { randomUUID } from "node:crypto";
 import {
+	PEER_FEATURE_NOTIFY_IDLE,
 	PEER_RECEIPT_TTL_MS,
 	type PeerConnection,
 	type PeerControlFrame,
@@ -220,7 +221,10 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		const lines: string[] = [];
 		/** Nonce of this send's notify_when_idle subscription, when requested. */
 		let notifyNonce: string | undefined;
-		if (opts.notifyWhenIdle === true) {
+		// Feature gate: a peer whose record doesn't advertise notify_idle runs an
+		// older plugin that would ignore the subscription frame anyway.
+		const peerCanNotifyIdle = record.features.includes(PEER_FEATURE_NOTIFY_IDLE);
+		if (opts.notifyWhenIdle === true && peerCanNotifyIdle) {
 			// The subscription precedes the message: it must cover the work this
 			// message triggers, and the peer processes lines in order.
 			notifyNonce = randomUUID();
@@ -251,7 +255,12 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			registerIdleNonce(notifyNonce);
 		}
 
-		return { msgId: frame.msg_id, to: record.socketPath, toName: record.name };
+		return {
+			msgId: frame.msg_id,
+			to: record.socketPath,
+			toName: record.name,
+			...(opts.notifyWhenIdle === true && !peerCanNotifyIdle ? { notifyIdleUnsupported: true } : {}),
+		};
 	}
 
 	const parentPath = identity.parent ? transport.resolveAddress(identity.parent.socketAddress) : undefined;

@@ -118,7 +118,7 @@ flowchart LR
 
 - **oh-my-pi has no `session_info_changed`**: renames are not broadcast to other peers. A renamed oh-my-pi session republishes its (derived) name on the next `session_start`; until then, peers see the old name.
 - **Idle delivery**: oh-my-pi's `sendUserMessage` with `deliverAs` only queues — it never starts a turn on an idle session; pi always routes through `prompt()`. The plugin therefore omits `deliverAs` when the receiving session is idle (both hosts then start a turn immediately) and passes `steer`/`followUp` only when the session is busy.
-- **Shutdown budget**: hosts give `session_shutdown` handlers roughly 2 seconds before continuing; registry unpublish and key deletion are best-effort synchronous, so this is normally ample, but a hung close could be cut off.
+- **Shutdown budget**: hosts give `session_shutdown` handlers a short grace period (on the order of seconds) before continuing; registry unpublish and key deletion are best-effort synchronous, so this is normally ample, but a hung close could be cut off.
 
 ## Development
 
@@ -142,9 +142,9 @@ Everything below is the wire-visible contract; interoperable implementations mus
 
 **Handshake.** First line `{"type":"auth","token":"<peerToken from the target's key file>"}`. Token auth is enforced on every platform; POSIX additionally relies on the registry dir's `0700` mode. A parent hands its socket address + child token to spawned subagents via `PI_PEERS_SOCKET`/`PI_PEERS_TOKEN`; a child token marks the sender as first-class (no consent prompt, not hop-counted).
 
-**Frames.** Envelope `{msgV:1, msg_id:uuid}` + `type: "user" | "control"`. User frame: `from/fromPid/fromSession`, optional `fromName`, `hopChain` (self-hop ≥10 drops, chain >28 drops), `priority: "now"|"next"`, `content` — for model-authored sends, content is wrapped as `<cross-session-message from="ADDR" from-name="NAME">…</cross-session-message>`. Control actions: `peer_message_status` (receipts: `held → delivered|denied|expired`, `refused`, `dropped:<reason>`), `notify_when_idle` (one-shot, nonce-correlated; fires immediately when the target is already idle), `peer_idle_notice`, `rename` (formerNames chaining).
+**Frames.** Envelope `{msgV:1, msg_id:uuid}` + `type: "user" | "control"`. User frame: `from/fromPid/fromSession`, optional `fromName`, `hopChain` (reserved for relay topologies: self-hop ≥10 drops, chain >28 drops — in the current direct-connect design every chain has length 1, so the effective loop protection is dedupe + per-sender and global rate buckets), `priority: "now"|"next"`, `content` — for model-authored sends, content is wrapped as `<cross-session-message from="ADDR" from-name="NAME">…</cross-session-message>`, and receivers re-wrap locally with the wire identity before injection (forged wrappers are dropped as `malformed-wrapper`). Addressing convention: `from` is always the sender's wire address; `reply_to` appears on control frames whose response must reach a specific endpoint (idle subscriptions). Control actions: `peer_message_status` (receipts: `held → delivered|denied|expired`, `refused`, `dropped:<reason>` — honored only for msg_ids the receiver actually sent), `notify_when_idle` (one-shot, nonce-correlated; fires immediately when the target is already idle; gated on the target's `features` advertising `notify_idle`), `peer_idle_notice` (honored only with a live one-shot nonce), `shutdown` (answered by `shutdown_response` with `inReplyTo` + `outcome: accepted|denied`), `rename` (formerNames chaining).
 
-**Anti-abuse on receive.** Per-sender token bucket (30 burst, 0.5/s refill), 30 s dedupe window, queue cap 50. Receipts flow back over a fresh connection to `reply_to`.
+**Anti-abuse on receive.** Per-sender token bucket (30 burst, 0.5/s refill), a global bucket across all senders (120 burst, 2/s refill — rotating the `from` field buys nothing), a generous child-class bucket (120/10s) for token-authenticated subagent connections, 30 s dedupe window, queue cap 50 accepted-since-idle. Receipts flow back over a fresh connection to `reply_to` (or `from` when absent).
 
 ## License
 
