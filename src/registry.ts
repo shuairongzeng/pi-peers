@@ -37,7 +37,7 @@ function parsePeerRecord(value: unknown): PeerRecord | undefined {
 	if (typeof r.cwd !== "string" || typeof r.name !== "string" || r.name === "") {
 		return undefined;
 	}
-	if (r.nameSource !== "user" && r.nameSource !== "derived") {
+	if (r.nameSource !== "user" && r.nameSource !== "derived" && r.nameSource !== "env") {
 		return undefined;
 	}
 	if (r.kind !== "interactive" && r.kind !== "rpc" && r.kind !== "print" && r.kind !== "json") {

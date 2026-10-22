@@ -41,6 +41,7 @@ interface ScriptedHost extends PeerHost {
 	hasUIValue: boolean;
 	policy: "ask" | "all" | "off";
 	idleNowValue: boolean;
+	quitCalls: number;
 }
 
 function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
@@ -54,6 +55,7 @@ function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
 		hasUIValue: true,
 		policy: "ask",
 		idleNowValue: false,
+		quitCalls: 0,
 		...overrides,
 		async injectUserMessage(content, priority) {
 			if (this.injectError) throw this.injectError;
@@ -77,6 +79,9 @@ function makeHost(overrides: Partial<ScriptedHost> = {}): ScriptedHost {
 		},
 		isIdleNow() {
 			return this.idleNowValue;
+		},
+		quit() {
+			this.quitCalls++;
 		},
 	};
 }
@@ -1106,5 +1111,99 @@ describe("createPeerInbox", () => {
 		const frame = userFrame();
 		await expect(inbox.handleFrame(frame, "peer")).resolves.toBeUndefined();
 		expect(host.injected.length).toBe(1);
+	});
+
+	it("accept policy all: shutdown frame quits with a notify naming the sender", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-1",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.quitCalls).toBe(1);
+		expect(host.userNotifies).toEqual([{ title: "peers", message: "Shutting down at request of peer alpha" }]);
+		expect(host.confirmCalls).toEqual([]);
+		// The inbox must not unpublish or close the server itself; no control
+		// traffic (e.g. no receipt) is produced for a shutdown frame.
+		expect(outbox.controlCalls).toEqual([]);
+	});
+
+	it("accept policy off: shutdown frame is ignored silently", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "off" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-2",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.quitCalls).toBe(0);
+		expect(host.userNotifies).toEqual([]);
+		expect(host.confirmCalls).toEqual([]);
+	});
+
+	it("accept policy ask: shutdown proceeds after user says yes", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-3",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.quitCalls).toBe(1);
+		expect(host.confirmCalls.length).toBe(1);
+		expect(host.userNotifies).toEqual([{ title: "peers", message: "Shutting down at request of peer alpha" }]);
+	});
+
+	it("accept policy ask: shutdown is refused when user says no", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "no" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-4",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.quitCalls).toBe(0);
+		expect(host.userNotifies).toEqual([]);
+		expect(host.confirmCalls.length).toBe(1);
+	});
+
+	it("accept policy ask: shutdown confirm message includes the reason when provided", async () => {
+		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-5",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+			reason: "work finished, please exit",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.confirmCalls.length).toBe(1);
+		expect(host.confirmCalls[0]!.message).toContain("work finished, please exit");
+		expect(host.quitCalls).toBe(1);
 	});
 });

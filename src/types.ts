@@ -52,6 +52,8 @@ export interface PeersExtensionContext {
 	 * older or smaller hosts simply omit the snapshot from the record).
 	 */
 	getContextUsage?: () => { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
+	/** Gracefully shut down the session's process (both pi and omp expose ctx.shutdown() in every context). */
+	shutdown(): void;
 }
 
 /** Tool-execution context (peers uses nothing beyond the base context). */
@@ -168,6 +170,10 @@ export const ENV_PEERS_SOCKET = "PI_PEERS_SOCKET";
 export const ENV_PEERS_TOKEN = "PI_PEERS_TOKEN";
 /** Override for the shared registry directory. */
 export const ENV_PEERS_DIR = "PI_PEERS_DIR";
+/** Spawner-assigned session name (wins over derived/user names at publish time). */
+export const ENV_PEERS_NAME = "PI_PEERS_NAME";
+/** When set on a spawned instance: exit automatically on the first idle after doing work. */
+export const ENV_PEERS_EPHEMERAL = "PI_PEERS_EPHEMERAL";
 
 /**
  * Product-independent registry directory so pi, oh-my-pi, and any other host
@@ -186,7 +192,7 @@ export function resolvePeersDir(env: NodeJS.ProcessEnv = process.env): string {
 
 export type PeerKind = "interactive" | "rpc" | "print" | "json";
 export type PeerStatus = "busy" | "idle";
-export type PeerNameSource = "user" | "derived";
+export type PeerNameSource = "user" | "derived" | "env";
 
 export interface PeerFormerName {
 	name: string;
@@ -323,7 +329,16 @@ export interface PeerIdleNoticeFrame extends PeerEnvelope {
 	nonce?: string;
 }
 
-export type PeerControlFrame = PeerMessageStatusFrame | PeerNotifyWhenIdleFrame | PeerIdleNoticeFrame;
+export interface PeerShutdownFrame extends PeerEnvelope {
+	type: "control";
+	action: "shutdown";
+	from: string;
+	fromName?: string;
+	/** Human/agent-readable explanation, surfaced in the quit confirmation. */
+	reason?: string;
+}
+
+export type PeerControlFrame = PeerMessageStatusFrame | PeerNotifyWhenIdleFrame | PeerIdleNoticeFrame | PeerShutdownFrame;
 export type PeerFrame = PeerUserFrame | PeerControlFrame;
 
 // ---------------------------------------------------------------------------
@@ -608,6 +623,8 @@ export interface PeerHost {
 	 * busy→idle transition that may never come).
 	 */
 	isIdleNow(): boolean;
+	/** Gracefully shut down this session's process (host ctx.shutdown()). */
+	quit(): void;
 }
 
 export interface PeerServiceDeps {
@@ -624,8 +641,41 @@ export interface PeerServiceDeps {
 }
 
 /** tool.ts */
+export interface PeerSpawnOptions {
+	/** Name for the new session (passed via env; wins over derived naming). */
+	name?: string;
+	/** Task sent to the new peer once it has registered. */
+	task?: string;
+	/** Run without a visible terminal window (host rpc mode). Default false. */
+	headless?: boolean;
+	/** Exit automatically on the first idle after doing work. Default false. */
+	ephemeral?: boolean;
+}
+
+export interface PeerSpawnOutcome {
+	pid: number;
+	name: string;
+	ref: string;
+	/** True when options.task was delivered to the new peer. */
+	taskSent: boolean;
+}
+
+export class PeerSpawnError extends Error {
+	readonly kind: "spawn_failed" | "register_timeout";
+	constructor(kind: PeerSpawnError["kind"], message: string) {
+		super(message);
+		this.name = "PeerSpawnError";
+		this.kind = kind;
+	}
+}
+
+/** index.ts provides the real process-spawning implementation; tests fake it. */
+export type PeerSpawner = (options: PeerSpawnOptions) => Promise<PeerSpawnOutcome>;
+
+/** tool.ts */
 export interface PeerToolDeps {
 	outbox: PeerOutbox;
 	registry: PeerRegistry;
 	identity: PeerIdentity;
+	spawner: PeerSpawner;
 }

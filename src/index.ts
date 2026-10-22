@@ -34,11 +34,14 @@ import { createPeerInbox } from "./inbox.ts";
 import { createPeerOutbox } from "./outbox.ts";
 import { createPeerProtocol } from "./protocol.ts";
 import { createPeerRegistry } from "./registry.ts";
-import { createPeerMessageTool, createPeersCommand } from "./tool.ts";
+import { createPeerSpawner } from "./spawn.ts";
+import { createPeerMessageTool, createPeersCommand, createPeerSpawnTool } from "./tool.ts";
 import { createPeerTransport } from "./transport.ts";
 import {
 	ENV_PEERS_ACCEPT,
 	ENV_PEERS_DISABLED,
+	ENV_PEERS_EPHEMERAL,
+	ENV_PEERS_NAME,
 	ENV_PEERS_SOCKET,
 	ENV_PEERS_TOKEN,
 	PEER_PROTOCOL_VERSION,
@@ -220,6 +223,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		},
 		hasUI: () => ctx?.hasUI ?? false,
 		isIdleNow: () => ctx?.isIdle() ?? false,
+		quit: () => ctx?.shutdown(),
 		acceptPolicy: (): PeerAcceptPolicy => {
 			const override = process.env[ENV_PEERS_ACCEPT];
 			if (override === "ask" || override === "all" || override === "off") return override;
@@ -278,10 +282,13 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	const publishRecord = (): void => {
 		if (ctx === undefined) return;
+		// Spawner-assigned name (PI_PEERS_NAME) wins over a user/derived name:
+		// it is the rendezvous key the spawning session waits for.
+		const envName = process.env[ENV_PEERS_NAME]?.trim();
 		const sessionName = ctx.sessionManager.getSessionName();
 		identity.sessionId = ctx.sessionManager.getSessionId();
 		const derivedName = `${basename(ctx.cwd) || "pi"}-${process.pid}`;
-		identity.name = sessionName ?? registry.normalizeName(derivedName);
+		identity.name = registry.normalizeName(envName ?? sessionName ?? derivedName);
 		record = {
 			version: 1,
 			pid: process.pid,
@@ -289,7 +296,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			cwd: ctx.cwd,
 			projectRoot: projectRoot ?? ctx.cwd,
 			name: identity.name,
-			nameSource: sessionName !== undefined ? "user" : "derived",
+			nameSource: envName ? "env" : sessionName !== undefined ? "user" : "derived",
 			formerNames: [...formerNames],
 			kind: mapModeToKind(ctx.mode),
 			status: ctx.isIdle() ? "idle" : "busy",
@@ -318,7 +325,9 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		});
 	};
 
-	pi.registerTool(createPeerMessageTool({ outbox, registry, identity }));
+	const spawner = createPeerSpawner({ registry, outbox, cwd: () => ctx?.cwd ?? process.cwd() });
+	pi.registerTool(createPeerMessageTool({ outbox, registry, identity, spawner }));
+	pi.registerTool(createPeerSpawnTool({ outbox, registry, identity, spawner }));
 
 	// Dual-form command registration: a function that also carries omp's
 	// options shape. pi reads .handler/.description; oh-my-pi calls the
@@ -338,7 +347,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		return `${rec.name} [${registry.refOf(rec)}]  ${rec.status}${usage}  ${rec.kind}  ${rec.cwd}  (${rec.sessionId.slice(0, 8)})${self ? "  (this session)" : ""}`;
 	};
 
-	const command = createPeersCommand({ outbox, registry, identity });
+	const command = createPeersCommand({ outbox, registry, identity, spawner });
 	const commandHandler = Object.assign(
 		async (args: string, commandCtx: PeersExtensionContext) => {
 			const live = registry.list().filter((entry) => entry.live);
@@ -427,8 +436,14 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	pi.on("agent_start", (_event, eventCtx) => {
 		ctx = eventCtx;
+		didWork = true;
 		setStatus("busy");
 	});
+
+	// Ephemeral instances (spawned with PI_PEERS_EPHEMERAL=1) quit on the first
+	// idle after having done work — one task, one report-back, exit.
+	const ephemeral = /^(1|true|yes)$/i.test(process.env[ENV_PEERS_EPHEMERAL] ?? "");
+	let didWork = false;
 
 	// Idle on both hosts: pi's agent_settled fires once per settled run;
 	// omp's agent_end fires per agent loop end, including continuation turns
@@ -438,6 +453,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		ctx = eventCtx;
 		setStatus("idle");
 		inbox.onIdle();
+		if (ephemeral && didWork) {
+			host.notify("peers", "Ephemeral peer finished its work — shutting down.");
+			host.quit();
+		}
 	};
 	pi.on("agent_settled", onIdleEvent);
 	pi.on("agent_end", onIdleEvent);

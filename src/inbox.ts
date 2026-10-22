@@ -184,6 +184,31 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 				await host.injectAgentNotice(`Peer "${frame.fromName ?? frame.from}" is now idle.`);
 				return;
 			}
+			case "shutdown": {
+				// Peer-requested shutdown of this session. The host's quit path
+				// triggers session_shutdown (unpublish + server teardown); the
+				// inbox never tears down transport state itself.
+				const policy = host.acceptPolicy();
+				if (policy === "off") {
+					return;
+				}
+				if (policy === "ask") {
+					const sender =
+						frame.fromName === undefined ? frame.from : `"${frame.fromName}" (${frame.from})`;
+					const reason = frame.reason === undefined ? "" : `\nReason: ${frame.reason}`;
+					const answer = await host.confirm(
+						"Peer shutdown request",
+						`Peer ${sender} asks to shut down this session.${reason}`,
+						PEER_APPROVAL_TIMEOUT_MS,
+					);
+					if (answer !== "yes") {
+						return;
+					}
+				}
+				host.notify("peers", `Shutting down at request of peer ${frame.fromName ?? frame.from}`);
+				host.quit();
+				return;
+			}
 		}
 	}
 

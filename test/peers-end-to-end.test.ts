@@ -65,6 +65,7 @@ function createFakeHost(): FakeHost {
 		},
 		hasUI: () => true,
 		isIdleNow: () => true,
+		quit: () => {},
 		acceptPolicy: () => host.policy,
 	};
 	return host;

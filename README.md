@@ -66,7 +66,9 @@ Tool reference (what the model sees):
 | `send_peer_message { action: "send", to, message }` | Deliver `message` to the peer's agent. `to` accepts a name (`"alice"`), a disambiguated name (`"alice [ab12cd]"`), a wire address copied from an incoming message, **or an array of any of those** to fan out the same message to up to 32 peers in one call (per-target results are aggregated; one failure doesn't abort the rest). |
 | `… { priority: "now" }` | Interrupt the peer's current work immediately instead of queueing behind it. |
 | `… { notifyWhenIdle: true }` | One-shot ping back to you when the peer goes idle — fires immediately if the peer is already idle. (Single-target sends only.) |
+| `… { action: "shutdown", to, reason? }` | Ask a peer to close its session gracefully (same project scoping as send). The peer obeys its own accept policy: `all` closes immediately, `ask` prompts the human there, `off` refuses. Collect the peer's results **before** shutting it down. |
 | `… { scope: "all" }` | Reach sessions in **other projects** (see below). |
+| `spawn_peer { name?, task?, headless?, ephemeral? }` | Launch a NEW agent instance as a managed peer. It reproduces your own host invocation (same binary/build), registers automatically, and is addressable by `name` right away. `task` is delivered the moment it comes online. `headless: true` runs it in the background (no terminal window); `ephemeral: true` makes it exit automatically once it has done its work and reported back. |
 
 ### Project scope
 
@@ -102,6 +104,8 @@ flowchart LR
 | `PI_PEERS_ACCEPT` | Inbound accept policy: `all` (accept silently — **the default**), `ask` (prompt the user), `off` (refuse). Peer messages are authenticated by a 0600 same-user token, so open-by-default is safe on a single-user machine; set `ask` on shared machines or while evaluating untrusted peers. |
 | `PI_PEERS_DISABLED` | `1`/`true`/`yes` disables the extension entirely — no tool, no command, no listener. |
 | `PI_PEERS_DIR` | Override the shared registry directory (default `~/.pi-peers`). All hosts read the same dir, so pi and oh-my-pi instances see each other. |
+| `PI_PEERS_NAME` | Assigned by `spawn_peer` to name the spawned session (wins over derived naming; recorded as `nameSource: "env"`). |
+| `PI_PEERS_EPHEMERAL` | Set by `spawn_peer` for ephemeral workers: the session exits on its first idle after doing work. |
 | `PI_PEERS_SOCKET` / `PI_PEERS_TOKEN` | Parent→child handoff for spawned subagents. Read-only for users. |
 
 ## Security model

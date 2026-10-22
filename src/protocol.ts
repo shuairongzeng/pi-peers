@@ -238,6 +238,20 @@ function validateControlFrame(obj: Record<string, unknown>): PeerControlFrame | 
 			nonce: obj.nonce,
 		};
 	}
+	if (action === "shutdown") {
+		if (!isString(obj.from)) return undefined;
+		if (!isOptionalString(obj.fromName)) return undefined;
+		if (!isOptionalString(obj.reason)) return undefined;
+		return {
+			msgV: PEER_PROTOCOL_VERSION,
+			msg_id: obj.msg_id,
+			type: "control",
+			action: "shutdown",
+			from: obj.from,
+			fromName: obj.fromName,
+			reason: obj.reason,
+		};
+	}
 	return undefined;
 }
 

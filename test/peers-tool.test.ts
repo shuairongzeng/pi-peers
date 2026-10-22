@@ -1,16 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type {
+	PeerControlFrame,
 	PeerIdentity,
 	PeerOutbox,
 	PeerRecord,
 	PeerRegistry,
 	PeerRegistryEntry,
+	PeerSpawner,
+	PeerSpawnOptions,
+	PeerSpawnOutcome,
 	PeerToolDeps,
 	PeersCommandContext,
 	PeersToolDefinition,
 } from "../src/types.ts";
-import { PeerSendError } from "../src/types.ts";
-import { createPeerMessageTool, createPeersCommand } from "../src/tool.ts";
+import { PeerSendError, PeerSpawnError } from "../src/types.ts";
+import { createPeerMessageTool, createPeerSpawnTool, createPeersCommand } from "../src/tool.ts";
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -62,19 +66,36 @@ function makeRegistry(entries: PeerRecord[]): PeerRegistry {
 	} as unknown as PeerRegistry;
 }
 
+/** Outbox fake: wraps a plain send impl and logs sendControl calls. */
 function makeOutbox(
 	sendImpl: (
 		target: string,
 		body: string,
 		opts: { priority?: "next" | "now"; notifyWhenIdle?: boolean },
 	) => Promise<never | { msgId: string; to: string; toName?: string }>,
-): PeerOutbox {
+): PeerOutbox & { controlCalls: Array<{ address: string; frame: PeerControlFrame }> } {
+	const controlCalls: Array<{ address: string; frame: PeerControlFrame }> = [];
 	return {
 		send: sendImpl,
-		sendControl: async () => {},
+		async sendControl(address, frame) {
+			controlCalls.push({ address, frame });
+		},
 		receiptOf: () => undefined,
 		handleReceipt: () => {},
-	} as unknown as PeerOutbox;
+		controlCalls,
+	};
+}
+
+/** Spawner fake: records every call and resolves a fixed outcome. */
+function makeSpawner(
+	outcome: PeerSpawnOutcome = { pid: 12345, name: "researcher", ref: "ab12cd", taskSent: false },
+): PeerSpawner & { calls: PeerSpawnOptions[] } {
+	const calls: PeerSpawnOptions[] = [];
+	const spawner = (options: PeerSpawnOptions): Promise<PeerSpawnOutcome> => {
+		calls.push(options);
+		return Promise.resolve(outcome);
+	};
+	return Object.assign(spawner, { calls });
 }
 
 function fakeIdentity(pid: number): PeerIdentity {
@@ -88,10 +109,17 @@ function fakeIdentity(pid: number): PeerIdentity {
 	};
 }
 
-function fakeDeps(opts: { outbox: PeerOutbox; entries?: PeerRecord[]; ownPid?: number }): PeerToolDeps {
+function fakeDeps(
+	opts: { outbox: PeerOutbox; entries?: PeerRecord[]; ownPid?: number; spawner?: PeerSpawner },
+): PeerToolDeps {
 	const ownPid = opts.ownPid ?? 100;
 	const registry = makeRegistry(opts.entries ?? []);
-	return { outbox: opts.outbox, registry, identity: fakeIdentity(ownPid) };
+	return {
+		outbox: opts.outbox,
+		registry,
+		identity: fakeIdentity(ownPid),
+		spawner: opts.spawner ?? makeSpawner(),
+	};
 }
 
 async function runTool(tool: PeersToolDefinition, params: Record<string, unknown>, cwd = "D:/work/alpha") {
@@ -520,6 +548,130 @@ describe("createPeerMessageTool error mapping", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tool: spawn_peer
+// ---------------------------------------------------------------------------
+
+describe("createPeerSpawnTool", () => {
+	it("returns name, ref, and pid and calls the spawner with the exact options", async () => {
+		const spawner = makeSpawner({ pid: 12345, name: "researcher", ref: "ab12cd", taskSent: false });
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })), spawner }));
+		const result = await runTool(tool, { name: "researcher", headless: true, ephemeral: true });
+		expect(result.isError).toBeUndefined();
+		expect(spawner.calls).toEqual([{ name: "researcher", task: undefined, headless: true, ephemeral: true }]);
+		const text = textOf(result);
+		expect(text).toContain('"researcher"');
+		expect(text).toContain("[ab12cd]");
+		expect(text).toContain("pid 12345");
+		expect(text).toContain("No task given.");
+	});
+
+	it("says the task was delivered when the spawner sent it", async () => {
+		const spawner = makeSpawner({ pid: 1, name: "worker", ref: "ff00aa", taskSent: true });
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })), spawner }));
+		const result = await runTool(tool, { name: "worker", task: "do the thing" });
+		expect(spawner.calls).toEqual([{ name: "worker", task: "do the thing", headless: undefined, ephemeral: undefined }]);
+		expect(textOf(result)).toContain("Task delivered.");
+	});
+
+	it("says no task was given when none was passed", async () => {
+		const spawner = makeSpawner();
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })), spawner }));
+		const result = await runTool(tool, {});
+		expect(spawner.calls).toEqual([{ name: undefined, task: undefined, headless: undefined, ephemeral: undefined }]);
+		expect(textOf(result)).toContain("No task given.");
+	});
+
+	it("maps PeerSpawnError to an isError result with the message", async () => {
+		const calls: PeerSpawnOptions[] = [];
+		const spawner: PeerSpawner = async (options) => {
+			calls.push(options);
+			throw new PeerSpawnError("register_timeout", 'spawned "x" but it did not register within 30s');
+		};
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })), spawner }));
+		const result = await runTool(tool, { name: "x" });
+		expect(calls).toEqual([{ name: "x", task: undefined, headless: undefined, ephemeral: undefined }]);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("Spawn failed:");
+		expect(text).toContain("register");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Tool: action "shutdown"
+// ---------------------------------------------------------------------------
+
+describe("createPeerMessageTool action=shutdown", () => {
+	const selfRecord = record({
+		pid: 100,
+		name: "me",
+		cwd: "D:/work/alpha",
+		projectRoot: "D:/work/alpha",
+		sessionId: "1000000000000000",
+	});
+	const alpha = record({
+		pid: 200,
+		name: "alpha",
+		cwd: "D:/work/alpha/sub",
+		projectRoot: "D:/work/alpha",
+		sessionId: "2000000000000000",
+		socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}`,
+	});
+	const beta = record({
+		pid: 300,
+		name: "beta",
+		cwd: "D:/work/beta",
+		projectRoot: "D:/work/beta",
+		sessionId: "3000000000000000",
+	});
+
+	it("sends one shutdown frame to the peer's wire address with from and reason", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
+		const result = await runTool(tool, { action: "shutdown", to: "alpha", reason: "work done" }, "D:/work/alpha");
+		expect(result.isError).toBeUndefined();
+		expect(outbox.controlCalls).toHaveLength(1);
+		const { address, frame } = outbox.controlCalls[0]!;
+		// Wire address form, derived from the record's connect path the same
+		// way the outbox does it.
+		expect(address).toBe(`pipe:LOCAL\\pi-peer-${"b".repeat(32)}`);
+		expect(frame.type).toBe("control");
+		expect(frame.action).toBe("shutdown");
+		if (frame.type === "control" && frame.action === "shutdown") {
+			expect(frame.from).toBe(`pipe:LOCAL\\pi-peer-${"f".repeat(32)}`);
+			expect(frame.fromName).toBe("me");
+			expect(frame.reason).toBe("work done");
+		}
+		expect(typeof frame.msg_id).toBe("string");
+		expect(textOf(result)).toContain('Shutdown requested for "alpha"');
+		expect(textOf(result)).toContain("accept policy");
+	});
+
+	it("shutdown to an unknown name is an invalid_target error", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord], ownPid: 100 }));
+		const result = await runTool(tool, { action: "shutdown", to: "ghost" }, "D:/work/alpha");
+		expect(outbox.controlCalls).toHaveLength(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("Invalid target");
+		expect(text).toContain("ghost");
+	});
+
+	it("shutdown to a cross-project peer is refused under the default scope", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, beta], ownPid: 100 }));
+		const result = await runTool(tool, { action: "shutdown", to: "beta" }, "D:/work/alpha");
+		expect(outbox.controlCalls).toHaveLength(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain("another project");
+		expect(text).toContain("D:/work/beta");
+		expect(text).toContain('scope: "all"');
+	});
+});
+
+// ---------------------------------------------------------------------------
 // /peers command
 // ---------------------------------------------------------------------------
 
@@ -546,6 +698,7 @@ describe("createPeersCommand", () => {
 				}),
 			]),
 			identity: fakeIdentity(100),
+			spawner: makeSpawner(),
 		});
 		const messages: Array<{ message: string; type?: string }> = [];
 		await command.handler("", {
@@ -573,6 +726,7 @@ describe("createPeersCommand", () => {
 				record({ pid: 200, name: "alpha", sessionId: "11111111", cwd: "D:/work/alpha" }),
 			]),
 			identity: fakeIdentity(100),
+			spawner: makeSpawner(),
 		});
 		const messages: Array<{ message: string; type?: string }> = [];
 		await command.handler("", {
@@ -588,6 +742,7 @@ describe("createPeersCommand", () => {
 			outbox: makeOutbox(async () => ({ msgId: "unused", to: "unused" })),
 			registry: makeRegistry([record({ pid: 100, name: "me" })]),
 			identity: fakeIdentity(100),
+			spawner: makeSpawner(),
 		});
 		const messages: string[] = [];
 		await command.handler("", {
@@ -602,6 +757,7 @@ describe("createPeersCommand", () => {
 			outbox: makeOutbox(async () => ({ msgId: "unused", to: "unused" })),
 			registry: makeRegistry([]),
 			identity: fakeIdentity(100),
+			spawner: makeSpawner(),
 		});
 		const messages: string[] = [];
 		await command.handler("", {

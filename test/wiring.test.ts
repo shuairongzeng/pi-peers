@@ -67,6 +67,7 @@ function createFakeCtx(cwd: string, overrides: Partial<PeersExtensionContext> = 
 			getCwd: () => cwd,
 		},
 		isIdle: () => true,
+		shutdown: () => {},
 		...overrides,
 	};
 }
@@ -204,7 +205,7 @@ describe("peers plugin wiring (dual-host)", () => {
 	it("appends the peers section to pi-shaped before_agent_start (systemPromptOptions)", async () => {
 		const { pi, handlers, tools } = createFakePi();
 		peersExtension(pi);
-		expect(tools).toHaveLength(1); // sanity: extension loaded
+		expect(tools).toHaveLength(2); // sanity: both tools registered
 
 		const ctx = createFakeCtx(peersDir);
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
@@ -497,6 +498,46 @@ describe("peers plugin wiring (dual-host)", () => {
 		} finally {
 			other.kill();
 			same.kill();
+		}
+	});
+
+	it("PI_PEERS_NAME wins over derived naming and stamps nameSource=env", async () => {
+		process.env.PI_PEERS_NAME = "Researcher Bot";
+		try {
+			const { pi, handlers } = createFakePi();
+			peersExtension(pi);
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, createFakeCtx(peersDir));
+			const record = readOwnRecord();
+			expect(record.name).toBe("researcher-bot");
+			expect(record.nameSource).toBe("env");
+		} finally {
+			delete process.env.PI_PEERS_NAME;
+		}
+	});
+
+	it("ephemeral instances quit on the first idle after work, never before", async () => {
+		process.env.PI_PEERS_EPHEMERAL = "1";
+		let quitCalls = 0;
+		try {
+			const { pi, handlers } = createFakePi();
+			peersExtension(pi);
+			const ctx = createFakeCtx(peersDir, {
+				shutdown: () => {
+					quitCalls++;
+				},
+			});
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+
+			// Idle without having worked: stay alive (e.g. still waiting for the task).
+			await handlers.get("agent_settled")?.({ type: "agent_settled", aborted: false }, ctx);
+			expect(quitCalls).toBe(0);
+
+			// Busy → idle: the work is done, time to exit.
+			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			await handlers.get("agent_settled")?.({ type: "agent_settled", aborted: false }, ctx);
+			expect(quitCalls).toBe(1);
+		} finally {
+			delete process.env.PI_PEERS_EPHEMERAL;
 		}
 	});
 });

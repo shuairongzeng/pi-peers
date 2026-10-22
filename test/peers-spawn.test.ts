@@ -1,0 +1,215 @@
+/**
+ * peers-spawn.test.ts — spawn engine: command reproduction, env contract,
+ * unique naming, registration wait, timeout, and the real-process path.
+ */
+
+import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createPeerRegistry } from "../src/registry.ts";
+import { createPeerSpawner, hostCommand, type PeerExec, type SpawnedProcess } from "../src/spawn.ts";
+import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, type PeerRecord } from "../src/types.ts";
+
+let peersDir: string;
+
+beforeEach(() => {
+	peersDir = mkdtempSync(join(tmpdir(), "pi-peers-spawn-"));
+	process.env[ENV_PEERS_DIR] = peersDir;
+});
+
+afterEach(() => {
+	delete process.env[ENV_PEERS_DIR];
+	rmSync(peersDir, { recursive: true, force: true });
+});
+
+function fakeRecord(name: string, pid: number): PeerRecord {
+	return {
+		version: 1,
+		pid,
+		sessionId: "sess-1",
+		cwd: peersDir,
+		projectRoot: peersDir,
+		name,
+		nameSource: "env",
+		formerNames: [],
+		kind: "rpc",
+		status: "idle",
+		statusUpdatedAt: Date.now(),
+		startedAt: Date.now(),
+		pidDomain: `win32:${hostname().toLowerCase()}`,
+		socketPath: "\\\\.\\pipe\\LOCAL\\nonexistent",
+		peerProtocol: 1,
+		features: [],
+	};
+}
+
+interface FakeProc extends SpawnedProcess {
+	env?: NodeJS.ProcessEnv;
+	headless?: boolean;
+}
+
+/** Exec that pretends the child registered instantly (record written under the test's own pid). */
+function fakeExec(captured: { env?: NodeJS.ProcessEnv; headless?: boolean }): PeerExec {
+	return (_command, _args, options) => {
+		captured.env = options.env;
+		captured.headless = options.headless;
+		writeFileSync(
+			join(peersDir, `${process.pid}.json`),
+			JSON.stringify(fakeRecord(options.env[ENV_PEERS_NAME] ?? "unset", process.pid)),
+		);
+		return { pid: process.pid, kill: () => {}, onError: () => {} };
+	};
+}
+
+const fakeOutbox = (sent: Array<{ target: string; content: string }>) => ({
+	send: async (target: string, content: string) => {
+		sent.push({ target, content });
+		return { msgId: "m1", to: "addr", toName: target };
+	},
+	sendControl: async () => {},
+	receiptOf: () => undefined,
+	handleReceipt: () => {},
+});
+
+describe("hostCommand", () => {
+	it("compiled host: executable only", () => {
+		expect(hostCommand(["C:\\omp\\omp.exe"], "C:\\omp\\omp.exe", [])).toEqual(["C:\\omp\\omp.exe"]);
+	});
+	it("source host: exe + loader flags + script", () => {
+		expect(hostCommand(["node", "src/cli.ts"], "node", ["--import", "file:///r.ts"])).toEqual([
+			"node",
+			"--import",
+			"file:///r.ts",
+			"src/cli.ts",
+		]);
+	});
+});
+
+describe("createPeerSpawner", () => {
+	it("assigns the requested name via env and waits for registration", async () => {
+		const captured: { env?: NodeJS.ProcessEnv } = {};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
+		const outcome = await spawner({ name: "researcher" });
+		expect(outcome.name).toBe("researcher");
+		expect(outcome.pid).toBe(process.pid);
+		expect(outcome.ref).toMatch(/^[0-9a-f]{6}$/);
+		expect(outcome.taskSent).toBe(false);
+		expect(captured.env?.[ENV_PEERS_NAME]).toBe("researcher");
+	});
+
+	it("auto-generates a unique worker name when omitted", async () => {
+		// A "taken" name must be backed by a LIVE pid: dead-pid records are swept by
+		// list(), which would make the name look free again. Spawn a keeper process.
+		const keeper = nodeSpawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			cwd: tmpdir(),
+			stdio: "ignore",
+		});
+		try {
+			const registry = createPeerRegistry(peersDir);
+			writeFileSync(join(peersDir, `${keeper.pid}.json`), JSON.stringify(fakeRecord("researcher", keeper.pid!)));
+			const captured: { env?: NodeJS.ProcessEnv } = {};
+			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
+			const outcome = await spawner({});
+			expect(outcome.name).toMatch(/^worker-[0-9a-z]{4}$/);
+
+			// Taken requested name gets a numeric suffix.
+			const outcome2 = await spawner({ name: "researcher" });
+			expect(outcome2.name).toBe("researcher-2");
+		} finally {
+			keeper.kill();
+		}
+	});
+
+	it("sets the ephemeral env flag only when requested", async () => {
+		const captured: { env?: NodeJS.ProcessEnv } = {};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
+		await spawner({ name: "a", ephemeral: true });
+		expect(captured.env?.[ENV_PEERS_EPHEMERAL]).toBe("1");
+		await spawner({ name: "b" });
+		expect(captured.env?.[ENV_PEERS_EPHEMERAL]).toBeUndefined();
+	});
+
+	it("never hands the parent's socket credentials to the child", async () => {
+		process.env.PI_PEERS_SOCKET = "pipe:LOCAL\\parent";
+		process.env.PI_PEERS_TOKEN = "secret";
+		try {
+			const captured: { env?: NodeJS.ProcessEnv } = {};
+			const registry = createPeerRegistry(peersDir);
+			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
+			await spawner({ name: "c" });
+			expect(captured.env?.PI_PEERS_SOCKET).toBeUndefined();
+			expect(captured.env?.PI_PEERS_TOKEN).toBeUndefined();
+		} finally {
+			delete process.env.PI_PEERS_SOCKET;
+			delete process.env.PI_PEERS_TOKEN;
+		}
+	});
+
+	it("sends the task after registration and reports taskSent", async () => {
+		const sent: Array<{ target: string; content: string }> = [];
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox(sent),
+			cwd: () => peersDir,
+			exec: fakeExec({}),
+		});
+		const outcome = await spawner({ name: "researcher", task: "summarize the repo" });
+		expect(outcome.taskSent).toBe(true);
+		expect(sent).toEqual([{ target: "researcher", content: "summarize the repo" }]);
+	});
+
+	it("times out when the child never registers", async () => {
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec: () => ({ pid: 1, kill: () => {}, onError: () => {} }),
+		});
+		await expect(spawner({ name: "ghost" })).rejects.toMatchObject({ kind: "register_timeout" });
+	});
+
+	it("real process: a node stub registers and is discovered", async () => {
+		// The stub writes its own registry record (its real pid) then stays alive.
+		const stub = `
+			const { writeFileSync } = require("node:fs");
+			const { hostname } = require("node:os");
+			const { join } = require("node:path");
+			const rec = {
+				version: 1, pid: process.pid, sessionId: "stub", cwd: process.cwd(),
+				name: process.env.${ENV_PEERS_NAME}, nameSource: "env", formerNames: [],
+				kind: "rpc", status: "idle", statusUpdatedAt: Date.now(), startedAt: Date.now(),
+				pidDomain: "win32:" + hostname().toLowerCase(),
+				socketPath: "\\\\\\\\.\\\\pipe\\\\LOCAL\\\\stub", peerProtocol: 1, features: [],
+			};
+			writeFileSync(join(process.env.${ENV_PEERS_DIR}, process.pid + ".json"), JSON.stringify(rec));
+			setInterval(() => {}, 1000);
+		`;
+		let child: ChildProcess | undefined;
+		const realExec: PeerExec = (_command, _args, options) => {
+			// cwd must NOT be the registry dir: on Windows a live child's cwd pins
+			// the directory and afterEach rmSync fails with EPERM.
+			child = nodeSpawn(process.execPath, ["-e", stub], {
+				cwd: tmpdir(),
+				env: options.env,
+				stdio: "ignore",
+			});
+			return { pid: child.pid, kill: () => child?.kill(), onError: (cb) => child?.once("error", cb) };
+		};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: realExec });
+		try {
+			const outcome = await spawner({ name: "stub-worker" });
+			expect(outcome.name).toBe("stub-worker");
+			expect(outcome.pid).toBe(child?.pid);
+		} finally {
+			child?.kill();
+		}
+	}, 20_000);
+});

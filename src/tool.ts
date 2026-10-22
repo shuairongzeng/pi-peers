@@ -1,16 +1,20 @@
 /**
- * The `send_peer_message` tool and the `/peers` command.
+ * The `send_peer_message` and `spawn_peer` tools and the `/peers` command.
  *
- * The tool is the model-facing entry into the outbox: it takes a peer name plus a body,
- * delegates to `PeerOutbox.send()`, and turns outcomes and `PeerSendError` codes into
- * actionable text. Listing and sending are scoped to this project by default
- * (same git repo root); `scope: "all"` widens them to the whole machine. The
+ * The message tool is the model-facing entry into the outbox: it takes a peer name plus a
+ * body, delegates to `PeerOutbox.send()`, and turns outcomes and `PeerSendError` codes into
+ * actionable text; its `action: "shutdown"` asks a peer to exit gracefully via a control
+ * frame. The spawn tool launches a new host session through the injected spawner so the
+ * agent can farm work out to fresh peers. Listing and sending are scoped to this project
+ * by default (same git repo root); `scope: "all"` widens them to the whole machine. The
  * command lists the live peers from the registry.
  *
  * See types.ts for the module contract and docs/peers.md for the user-facing design.
  */
 
+import { randomUUID } from "node:crypto";
 import { type Static, Type } from "typebox";
+
 import type {
 	PeersCommandContext,
 	PeersToolDefinition,
@@ -19,10 +23,13 @@ import type {
 	PeerRegistry,
 	PeerSendOptions,
 	PeerSendOutcome,
+	PeerShutdownFrame,
+	PeerSpawnOptions,
 	PeerToolDeps,
 } from "./types.ts";
-import { PeerSendError, normalizeFsPath, projectRootOf, sameProject } from "./types.ts";
-import type { PeerRegistryEntry, PeerSendErrorCode } from "./types.ts";
+import { PEER_PROTOCOL_VERSION, PeerSendError, PeerSpawnError, normalizeFsPath, projectRootOf, sameProject } from "./types.ts";
+import type { PeerRegistryEntry, PeerSendErrorCode, PeersToolContext } from "./types.ts";
+import { addressFromPath } from "./transport.ts";
 
 // ---------------------------------------------------------------------------
 // Tool
@@ -32,10 +39,11 @@ export const PEER_MESSAGE_TOOL_NAME = "send_peer_message";
 
 export const peerMessageSchema = Type.Object({
 	action: Type.Optional(
-		Type.Union([Type.Literal("send"), Type.Literal("list")], {
+		Type.Union([Type.Literal("send"), Type.Literal("list"), Type.Literal("shutdown")], {
 			description:
 				'"send" (default): deliver a message to a peer. ' +
-				'"list": show the live peer sessions on this machine (use this first when you do not know the peer\'s name).',
+				'"list": show the live peer sessions on this machine (use this first when you do not know the peer\'s name). ' +
+				'"shutdown": ask a peer to close its session gracefully.',
 		}),
 	),
 	to: Type.Optional(
@@ -79,6 +87,13 @@ export const peerMessageSchema = Type.Object({
 	notifyWhenIdle: Type.Optional(
 		Type.Boolean({ description: "Also ask the peer to notify us once when it next becomes idle." }),
 	),
+	reason: Type.Optional(
+		Type.String({
+			description:
+				'Shutdown explanation, shown to the peer (its human may see it in the quit confirmation). ' +
+				'Optional; only used with action: "shutdown".',
+		}),
+	),
 	scope: Type.Optional(
 		Type.Union([Type.Literal("project"), Type.Literal("all")], {
 			description:
@@ -100,7 +115,7 @@ Sends a message to another running pi instance ("peer") on the same machine. The
 - When you RECEIVE a \`<cross-session-message from="ADDRESS" from-name="X" …>\` in your context, that is a message from peer X. If it asks for a reply or reports results back, you MUST answer by calling this tool — \`to\` accepts the message's \`from\` address verbatim, or the sender's name. Writing the answer only in your local chat never reaches the sender — they cannot see your screen.
 - A send failing with "belongs to another project" is a scoping block, not a missing peer: the target exists in another project; resend with \`scope: "all"\` only if the user asked to reach that session.
 - If several sessions share one name, the send fails with a candidate list; resend with "name [ref]" to disambiguate, e.g. "alice [ab12cd]".
-- \`priority\`: "next" (default) queues the message until the peer's current work finishes; "now" interrupts the peer immediately. Use "now" sparingly.
+- \`action: "shutdown"\` asks the peer to close its session gracefully. The peer's own accept policy decides: with "ask" the human there may be asked to confirm, and it may refuse. Collect any results or state you need from the peer BEFORE shutting it down — after it exits there is nothing left to ask.
 - \`notifyWhenIdle\`: also subscribes (once) to be notified when the peer next becomes idle.
 - Success only means the message reached the peer's queue. A receipt (delivered / held / denied / expired / refused / dropped) follows asynchronously and is injected into your context when it arrives.
 - Silence is not consent: no reply within a timeout does not mean the peer agreed or acted.
@@ -249,6 +264,121 @@ async function attemptSend(
 	}
 }
 
+/**
+ * Resolve a shutdown target to its wire address with the same resolution and
+ * project-scope rules as a send: "name", "name [ref]", or the raw address,
+ * with cross-project targets refused under the default scope. Registry
+ * records store the connect path; sendControl() takes the wire address
+ * form, so the conversion goes through transport.addressFromPath — the
+ * same helper the outbox itself uses for sends.
+ */
+function resolveShutdownTarget(
+	deps: PeerToolDeps,
+	target: string,
+	scope: "project" | "all",
+	selfCwd: string,
+): { address: string; entry: PeerRegistryEntry } | PeerSendError {
+	if (scope === "project") {
+		const crossProject = findCrossProjectTarget(deps, target, selfCwd);
+		if (crossProject !== undefined) {
+			return crossProject;
+		}
+	}
+	const resolution = deps.registry.resolve(target);
+	if (resolution.kind === "none") {
+		return new PeerSendError(
+			"invalid_target",
+			`no live peer matches "${target}": the peer may not be running or may have exited. ` +
+				'Call with action: "list" to see live peers first',
+		);
+	}
+	if (resolution.kind === "ambiguous") {
+		return new PeerSendError(
+			"ambiguous",
+			`several live peers match "${target}"; resend with "name [ref]" to disambiguate`,
+			resolution.candidates.map((candidate) =>
+				`${candidate.record.name} [${deps.registry.refOf(candidate.record)}] ${candidate.record.status} ${candidate.record.cwd}`,
+			),
+		);
+	}
+	const { entry } = resolution;
+	if (!entry.live) {
+		return new PeerSendError(
+			"offline",
+			`peer "${entry.record.name}" (pid ${entry.record.pid}) has a registry record but its process is dead`,
+		);
+	}
+	const address = addressFromPath(entry.record.socketPath);
+	if (address === undefined) {
+		return new PeerSendError("invalid_target", `unrecognized peer socket path: ${entry.record.socketPath}`);
+	}
+	return { address, entry };
+}
+
+/**
+ * action: "shutdown" — resolve the target with the same resolution and
+ * project-scope rules as a send, build a PeerShutdownFrame, and hand it to
+ * outbox.sendControl (which takes the peer's wire address). Resolution
+ * failures reuse the tool's PeerSendError text mapping.
+ */
+async function runShutdownAction(
+	deps: PeerToolDeps,
+	params: PeerMessageInput,
+	scope: "project" | "all",
+	ctx: PeersToolContext,
+): Promise<PeersToolResult> {
+	const target = params.to;
+	if (typeof target !== "string" || target.trim() === "") {
+		return {
+			content: [
+				{ type: "text", text: 'Missing "to". Call with action: "list" to discover live peers first.' },
+			],
+			details: {},
+			isError: true,
+		};
+	}
+	const resolved = resolveShutdownTarget(deps, target, scope, ctx.cwd);
+	if (resolved instanceof PeerSendError) {
+		return {
+			content: [{ type: "text", text: describeSendError(resolved, deps.registry, deps.identity.pid) }],
+			details: {},
+			isError: true,
+		};
+	}
+	const reason =
+		params.reason !== undefined && params.reason.trim() !== "" ? params.reason.trim() : undefined;
+	const frame: PeerShutdownFrame = {
+		msgV: PEER_PROTOCOL_VERSION,
+		msg_id: randomUUID(),
+		type: "control",
+		action: "shutdown",
+		from: deps.identity.socketAddress,
+		...(deps.identity.name !== "" ? { fromName: deps.identity.name } : {}),
+		...(reason !== undefined ? { reason } : {}),
+	};
+	try {
+		await deps.outbox.sendControl(resolved.address, frame);
+	} catch (error) {
+		if (error instanceof PeerSendError) {
+			return {
+				content: [{ type: "text", text: describeSendError(error, deps.registry, deps.identity.pid) }],
+				details: {},
+				isError: true,
+			};
+		}
+		throw error;
+	}
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Shutdown requested for "${resolved.entry.record.name}". (The peer obeys its own accept policy.)`,
+			},
+		],
+		details: {},
+	};
+}
+
 export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<PeerMessageInput> {
 	return {
 		name: PEER_MESSAGE_TOOL_NAME,
@@ -262,6 +392,9 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 					content: [{ type: "text", text: listLivePeers(deps.registry, deps.identity.pid, scope, ctx.cwd) }],
 					details: {},
 				};
+			}
+			if (params.action === "shutdown") {
+				return runShutdownAction(deps, params, scope, ctx);
 			}
 			if (!params.to || (Array.isArray(params.to) && params.to.length === 0) || !params.message) {
 				return {
@@ -358,6 +491,98 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 				result.isError = false;
 			}
 			return result;
+		},
+	};
+}
+
+// ---------------------------------------------------------------------------
+// spawn_peer tool
+// ---------------------------------------------------------------------------
+
+export const PEER_SPAWN_TOOL_NAME = "spawn_peer";
+
+export const peerSpawnSchema = Type.Object({
+	name: Type.Optional(
+		Type.String({
+			description:
+				"Name for the new session (e.g. \"researcher\"). Auto-derived when omitted. " +
+				"Address the peer by this name in later send_peer_message calls.",
+		}),
+	),
+	task: Type.Optional(
+		Type.String({
+			description:
+				"Task message delivered to the new peer as soon as it is online, as user input to its agent. " +
+				"For large tasks, write them to a file and send the path instead.",
+		}),
+	),
+	headless: Type.Optional(
+		Type.Boolean({
+			description: "Run in the background without a visible terminal window. Default false.",
+		}),
+	),
+	ephemeral: Type.Optional(
+		Type.Boolean({
+			description:
+				"The new session exits automatically once it has done its work and reported back. Default false. " +
+				"Use with task for one-shot jobs; omit when follow-up questions are expected.",
+		}),
+	),
+});
+
+export type PeerSpawnInput = Static<typeof peerSpawnSchema>;
+
+const PEER_SPAWN_DESCRIPTION = `# Spawn a new pi session on this machine
+
+Launches a new pi instance that immediately registers as a peer. Use this to run work in parallel: the new session is a full agent with its own context window.
+
+- The spawned session auto-registers in the peer list: address it by \`name\` in later \`send_peer_message\` calls (or its "name [ref]" when names collide).
+- Its replies arrive as \`<cross-session-message from="ADDRESS" from-name="X" …>\` user messages in your context, like any peer's.
+- Use \`task\` + \`ephemeral\` for one-shot jobs: the peer gets the task up front and exits by itself once it has done its work and reported back.
+- Omit \`ephemeral\` when follow-up questions are expected — an ephemeral peer cannot be asked anything after it exits.
+- \`headless\` runs it in the background without a visible terminal window; leave it false when the user may want to watch or interact with the new session.
+- The spawn waits for the new session to register (its record appears in the peer list). A failure here means the session did not start or did not register — nothing was lost, retry.
+- Do not use this to message an EXISTING peer — that is the \`send_peer_message\` tool. Spawn is only for creating new sessions.`;
+
+export function createPeerSpawnTool(deps: PeerToolDeps): PeersToolDefinition<PeerSpawnInput> {
+	return {
+		name: PEER_SPAWN_TOOL_NAME,
+		label: "Spawn Peer",
+		description: PEER_SPAWN_DESCRIPTION,
+		parameters: peerSpawnSchema,
+		async execute(_toolCallId, params: PeerSpawnInput): Promise<PeersToolResult> {
+			const options: PeerSpawnOptions = {
+				name: params.name,
+				task: params.task,
+				headless: params.headless,
+				ephemeral: params.ephemeral,
+			};
+			try {
+				const outcome = await deps.spawner(options);
+				const taskNote = outcome.taskSent
+					? "Task delivered."
+					: params.task !== undefined
+						? "Task NOT delivered — send it yourself with send_peer_message."
+						: "No task given.";
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Spawned peer "${outcome.name}" [${outcome.ref}] (pid ${outcome.pid}). ${taskNote}`,
+						},
+					],
+					details: { ...outcome },
+				};
+			} catch (error) {
+				if (error instanceof PeerSpawnError) {
+					return {
+						content: [{ type: "text", text: `Spawn failed: ${error.message}` }],
+						details: { kind: error.kind },
+						isError: true,
+					};
+				}
+				throw error;
+			}
 		},
 	};
 }
