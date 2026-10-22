@@ -380,7 +380,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			if (!deps.outbox.consumeIdleNonce(frame.nonce)) {
 				return;
 			}
-			const peerName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+			const peerName = protocol.sanitizePeerText(frame.fromName ?? recordForAddress(frame.from)?.name ?? frame.from);
 			await host.injectAgentNotice(`Peer "${peerName}" is now idle.`);
 			return;
 		}

@@ -306,7 +306,10 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			case "dropped":
 			case "refused": {
 				const text = `Peer message to ${sender} (${frame.msg_id}) was ${frame.state}${suffix}.`;
+				// The agent needs it (recovery decisions) and the human needs it
+				// (delivery failure is exactly the news a toast exists for).
 				void host.injectAgentNotice(text).catch(() => {});
+				host.notify("Peer message failed", text);
 				break;
 			}
 			case "held":

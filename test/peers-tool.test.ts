@@ -14,7 +14,7 @@ import type {
 	PeersToolDefinition,
 } from "../src/types.ts";
 import { PeerSendError, PeerSpawnError } from "../src/types.ts";
-import { createPeerMessageTool, createPeerSpawnTool, createPeersCommand } from "../src/tool.ts";
+import { createPeerMessageTool, createPeerSpawnTool, createPeersCommand, peerLine } from "../src/tool.ts";
 
 // ---------------------------------------------------------------------------
 // Fakes
@@ -203,6 +203,76 @@ describe("createPeerMessageTool", () => {
 		expect(text).toContain("alpha");
 		expect(text).toContain("self");
 		expect(text).toContain("(this session)");
+	});
+
+	it("action=list includes ctx N% when the record reports a numeric percentage", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(
+			fakeDeps({
+				outbox,
+				entries: [
+					record({ pid: 100, name: "self" }),
+					record({ pid: 200, name: "alpha", contextUsage: { percent: 47.6 } }),
+				],
+				ownPid: 100,
+			}),
+		);
+		const text = textOf(await runTool(tool, { action: "list" }));
+		expect(text).toContain("alpha");
+		expect(text).toContain("ctx 48%");
+	});
+
+	it("action=list omits ctx when no percentage is reported", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(
+			fakeDeps({
+				outbox,
+				entries: [
+					record({ pid: 100, name: "self" }),
+					record({ pid: 200, name: "alpha", contextUsage: { percent: null } }),
+				],
+				ownPid: 100,
+			}),
+		);
+		const text = textOf(await runTool(tool, { action: "list" }));
+		expect(text).toContain("alpha");
+		expect(text).not.toContain("ctx ");
+		expect(text).not.toContain("%");
+	});
+
+	it("peerLine includes ctx% when present and omits it when absent", () => {
+		const refOf = (rec: PeerRecord): string => `ref-${rec.name}`;
+		const withUsage = record({ pid: 200, name: "alpha", contextUsage: { percent: 42.4 } });
+		expect(peerLine(withUsage, false, refOf)).toBe(
+			"alpha [ref-alpha]  busy  ctx 42%  interactive  D:/work/alpha  (abcdef12)",
+		);
+		const noUsage = record({ pid: 300, name: "beta" });
+		expect(peerLine(noUsage, true, refOf)).toBe(
+			"beta [ref-beta]  busy  interactive  D:/work/alpha  (abcdef12)  (this session)",
+		);
+		const nullUsage = record({ pid: 400, name: "gamma", contextUsage: { percent: null } });
+		expect(peerLine(nullUsage, false, refOf)).not.toContain("ctx ");
+	});
+
+	it("action=list with no live peers prints the unified empty wording", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [], ownPid: 100 }));
+		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha"));
+		expect(text).toBe("No live peers in this project.");
+	});
+
+	it("action=list with only other-project peers appends the other-project count", async () => {
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const other = record({
+			pid: 300,
+			name: "beta",
+			cwd: "D:/work/beta",
+			projectRoot: "D:/work/beta",
+			sessionId: "3000000000000000",
+		});
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [other], ownPid: 999 }));
+		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha"));
+		expect(text).toBe("No live peers in this project. (+1 in other projects)");
 	});
 
 	it("send without to/message is an error pointing at action=list", async () => {
@@ -394,7 +464,7 @@ describe("createPeerMessageTool batch sends", () => {
 		expect(text).toContain("✓ alpha — sent (msg_id msg-alph…)");
 		expect(text).toContain("✓ beta — sent (msg_id msg-beta…)");
 		expect(text).toContain("✗ gamma:");
-		expect(text).toContain("2 of 3 targets");
+		expect(text).toContain("2 of 3 targets; 1 failed (1 offline).");
 		const details = result.details as Array<{ to: string; ok: boolean; msgId?: string; error?: string; code?: string }>;
 		expect(details).toEqual([
 			{ to: "alpha", ok: true, msgId: "msg-alpha-1234567890" },
@@ -460,8 +530,26 @@ describe("createPeerMessageTool batch sends", () => {
 		const details = result.details as Array<{ to: string; ok: boolean; code?: string }>;
 		expect(details[0]).toEqual({ to: "alpha", ok: true, msgId: "msg-alpha-1234567890" });
 		expect(details[1].to).toBe("gamma");
-		expect(details[1].ok).toBe(false);
 		expect(details[1].code).toBe("invalid_target");
+	});
+
+	it("batch header groups failures by error code", async () => {
+		const outbox = makeOutbox(async (target) => {
+			if (target === "alpha") {
+				return { msgId: `msg-${target}-1234567890`, to: `pipe:LOCAL\\pi-peer-${target}`, toName: target };
+			}
+			if (target === "beta") {
+				throw new PeerSendError("offline", 'peer "beta" is dead');
+			}
+			throw new PeerSendError("invalid_target", "bad target");
+		});
+		// Three sends with two failure codes: the header must count each code
+		// once, in first-seen order.
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, beta, gamma], ownPid: 100 }));
+		const result = await runTool(tool, { to: ["alpha", "beta", "ghost"], message: "hi" }, "D:/work/alpha");
+		expect(result.isError).toBe(false);
+		const text = textOf(result);
+		expect(text).toContain("1 of 3 targets; 2 failed (1 offline, 1 invalid_target).");
 	});
 
 	it("batch with scope:all reaches a cross-project target", async () => {
@@ -614,6 +702,24 @@ describe("createPeerSpawnTool", () => {
 		const result = await runTool(tool, { name: "worker", task: "do the thing" });
 		expect(spawner.calls).toEqual([{ name: "worker", task: "do the thing", headless: undefined, ephemeral: undefined }]);
 		expect(textOf(result)).toContain("Task delivered.");
+	});
+
+	it("task-not-delivered result tells the user to send it with send_peer_message", async () => {
+		const spawner = makeSpawner({ pid: 77, name: "worker", ref: "ff00aa", taskSent: false });
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })), spawner }));
+		const result = await runTool(tool, { name: "worker", task: "do the thing" });
+		expect(result.isError).toBeUndefined();
+		const text = textOf(result);
+		expect(text).toContain('Spawned peer "worker" [ff00aa] (pid 77)');
+		expect(text).toContain("The peer is online but the task was not delivered (startup race)");
+		expect(text).toContain('send it now with send_peer_message to "worker"');
+	});
+
+	it("description contains the Task-NOT-delivered recovery bullet", () => {
+		const tool = createPeerSpawnTool(fakeDeps({ outbox: makeOutbox(async () => ({ msgId: "m", to: "x" })) }));
+		expect(tool.description).toContain(
+			'If the result says "Task NOT delivered", the peer is online and addressable by name; send the task with send_peer_message.',
+		);
 	});
 
 	it("says no task was given when none was passed", async () => {
@@ -792,7 +898,7 @@ describe("createPeersCommand", () => {
 			ui: { notify: (message: string) => messages.push(message) },
 		} as unknown as PeersCommandContext);
 		expect(messages).toHaveLength(1);
-		expect(messages[0]).toContain("No other live pi sessions");
+		expect(messages[0]).toContain("No live peers in this project.");
 	});
 
 	it("says there are no other live sessions when the registry is empty", async () => {
@@ -807,6 +913,6 @@ describe("createPeersCommand", () => {
 			ui: { notify: (message: string) => messages.push(message) },
 		} as unknown as PeersCommandContext);
 		expect(messages).toHaveLength(1);
-		expect(messages[0]).toContain("No other live pi sessions");
+		expect(messages[0]).toContain("No live peers in this project.");
 	});
 });

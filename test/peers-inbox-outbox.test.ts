@@ -777,7 +777,13 @@ describe("createPeerOutbox", () => {
 		outbox.handleReceipt(statusFrame({ msg_id: "m-11", state: "expired" }));
 		outbox.handleReceipt(statusFrame({ msg_id: "m-12", state: "refused" }));
 
-		expect(host.userNotifies).toEqual([]);
+		// Negative receipts reach BOTH the agent (notices) and the human (userNotifies).
+		expect(host.userNotifies).toEqual([
+			{ title: "Peer message failed", message: "Peer message to alpha (m-9) was denied: rejected by user." },
+			{ title: "Peer message failed", message: "Peer message to alpha (m-10) was dropped: rate-limited." },
+			{ title: "Peer message failed", message: "Peer message to alpha (m-11) was expired." },
+			{ title: "Peer message failed", message: "Peer message to alpha (m-12) was refused." },
+		]);
 		expect(host.notices).toEqual([
 			"Peer message to alpha (m-9) was denied: rejected by user.",
 			"Peer message to alpha (m-10) was dropped: rate-limited.",

@@ -122,9 +122,17 @@ Sends a message to another running pi instance ("peer") on the same machine. The
 - \`to\` accepts an array of peer names (up to 32) to batch-send the same message to all of them: one send per target, a failing target does not stop the rest, and the result reports one line per target. Batch sends cannot use \`notifyWhenIdle\`.
 - For large content, write it to a file and send the file path in the message; each message is capped at 1 MiB on the wire.`;
 
-function peerLine(record: PeerRecord, ref: string, self: boolean): string {
+/**
+ * One listing line for a live peer, shared by the tool's `action: "list"`
+ * rendering and the /peers command (index.ts reuses it for its scoped view).
+ * The context fill (`ctx N%`) appears right after the status when the record
+ * reports a numeric percentage; absent or null percentages print nothing.
+ */
+export function peerLine(record: PeerRecord, self: boolean, refOf: (record: PeerRecord) => string): string {
+	const pct = record.contextUsage?.percent;
+	const usage = typeof pct === "number" ? `  ctx ${Math.round(pct)}%` : "";
 	const suffix = self ? "  (this session)" : "";
-	return `${record.name} [${ref}]  ${record.status}  ${record.kind}  ${record.cwd}  (${record.sessionId.slice(0, 8)})${suffix}`;
+	return `${record.name} [${refOf(record)}]  ${record.status}${usage}  ${record.kind}  ${record.cwd}  (${record.sessionId.slice(0, 8)})${suffix}`;
 }
 
 function listLivePeers(
@@ -138,11 +146,9 @@ function listLivePeers(
 	const entries = scope === "all" ? live : live.filter((entry) => sameProject(entry));
 	const hidden = live.length - entries.length;
 	if (entries.length === 0) {
-		return hidden > 0 ? `No live peers in this project. (+${hidden} in other projects)` : "No live peers.";
+		return hidden > 0 ? `No live peers in this project. (+${hidden} in other projects)` : "No live peers in this project.";
 	}
-	const lines = entries.map((entry) =>
-		peerLine(entry.record, registry.refOf(entry.record), entry.record.pid === selfPid),
-	);
+	const lines = entries.map((entry) => peerLine(entry.record, entry.record.pid === selfPid, registry.refOf));
 	if (hidden > 0) {
 		lines.push(`(+${hidden} in other projects)`);
 	}
@@ -490,12 +496,21 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 				lines.push(`✗ ${target}: ${failureText}`);
 			}
 			const okCount = params.to.length - failures;
+			// Failures grouped by code in the header (e.g. "2 failed (1 offline,
+			// 1 invalid_target)"); non-PeerSendError failures fall into "other".
+			const failuresByCode = new Map<string, number>();
+			for (const detail of details) {
+				if (detail.ok) continue;
+				const key = detail.code ?? "other";
+				failuresByCode.set(key, (failuresByCode.get(key) ?? 0) + 1);
+			}
+			const failureGroups = [...failuresByCode.entries()].map(([code, count]) => `${count} ${code}`).join(", ");
 			const header =
 				failures === 0
 					? `Sent to ${params.to.length} peers. Receipts will follow asynchronously.`
 					: okCount === 0
 						? `Send failed for all ${params.to.length} targets.`
-						: `Sent to ${okCount} of ${params.to.length} targets; ${failures} failed.`;
+						: `Sent to ${okCount} of ${params.to.length} targets; ${failures} failed (${failureGroups}).`;
 			const result: PeersToolResult = {
 				content: [{ type: "text", text: `${header}\n${lines.join("\n")}` }],
 				details,
@@ -557,6 +572,7 @@ Launches a new pi instance that immediately registers as a peer. Use this to run
 - Omit \`ephemeral\` when follow-up questions are expected — an ephemeral peer cannot be asked anything after it exits.
 - \`headless\` runs it in the background without a visible terminal window; leave it false when the user may want to watch or interact with the new session.
 - The spawn waits for the new session to register (its record appears in the peer list). A failure here means the session did not start or did not register — nothing was lost, retry.
+- If the result says "Task NOT delivered", the peer is online and addressable by name; send the task with send_peer_message.
 - Do not use this to message an EXISTING peer — that is the \`send_peer_message\` tool. Spawn is only for creating new sessions.`;
 
 export function createPeerSpawnTool(deps: PeerToolDeps): PeersToolDefinition<PeerSpawnInput> {
@@ -574,11 +590,20 @@ export function createPeerSpawnTool(deps: PeerToolDeps): PeersToolDefinition<Pee
 			};
 			try {
 				const outcome = await deps.spawner(options);
-				const taskNote = outcome.taskSent
-					? "Task delivered."
-					: params.task !== undefined
-						? "Task NOT delivered — send it yourself with send_peer_message."
-						: "No task given.";
+				if (!outcome.taskSent && params.task !== undefined) {
+					// Startup race: the peer registered but the task could not be
+					// delivered — the recovery is an ordinary send by name.
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Spawned peer "${outcome.name}" [${outcome.ref}] (pid ${outcome.pid}). The peer is online but the task was not delivered (startup race) — send it now with send_peer_message to "${outcome.name}".`,
+							},
+						],
+						details: { ...outcome },
+					};
+				}
+				const taskNote = outcome.taskSent ? "Task delivered." : "No task given.";
 				return {
 					content: [
 						{
@@ -618,11 +643,13 @@ export function createPeersCommand(deps: PeerToolDeps): PeersCommandDefinition {
 			const live = deps.registry.list().filter((entry) => entry.live);
 			const others = live.filter((entry) => entry.record.pid !== deps.identity.pid);
 			if (others.length === 0) {
-				ctx.ui.notify("No other live pi sessions on this machine.", "info");
+				// No other sessions anywhere (the command lists machine-wide), so
+				// the unified empty wording applies without a cross-project count.
+				ctx.ui.notify("No live peers in this project.", "info");
 				return;
 			}
 			const lines = live.map((entry) =>
-				peerLine(entry.record, deps.registry.refOf(entry.record), entry.record.pid === deps.identity.pid),
+				peerLine(entry.record, entry.record.pid === deps.identity.pid, deps.registry.refOf),
 			);
 			ctx.ui.notify(`Live pi sessions:\n${lines.join("\n")}`, "info");
 		},
