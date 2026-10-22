@@ -222,7 +222,7 @@ describe("createPeerMessageTool project scoping", () => {
 		expect(text).toContain("me");
 		expect(text).toContain("alpha");
 		expect(text).not.toContain("beta");
-		expect(text).toContain('(+1 sessions in other projects hidden; pass scope: "all" to include)');
+		expect(text).toContain("(+1 in other projects)");
 	});
 
 	it("list with scope:all lists every live session", async () => {
@@ -281,7 +281,7 @@ describe("createPeerMessageTool project scoping", () => {
 		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha/"));
 		expect(text).toContain("alpha");
 		expect(text).not.toContain("beta");
-		expect(text).toContain('(+1 sessions in other projects hidden; pass scope: "all" to include)');
+		expect(text).toContain("(+1 in other projects)");
 
 		const sendResult = await runTool(tool, { to: "beta", message: "hi" }, "D:/work/alpha/");
 		expect(sendResult.isError).toBe(true);

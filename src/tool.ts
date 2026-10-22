@@ -84,7 +84,7 @@ export const peerMessageSchema = Type.Object({
 			description:
 				'"project" (default): only sessions in this same project (same git repo root) are listed and reachable. ' +
 				'"all": widen to every live session on this machine, including other projects. ' +
-				'Cross-project sends require "all".',
+				'Only use "all" when the user explicitly asks to reach a session in another project; cross-project sends require it.',
 		}),
 	),
 });
@@ -95,10 +95,10 @@ const PEER_MESSAGE_DESCRIPTION = `# Send a message to another pi session on this
 
 Sends a message to another running pi instance ("peer") on the same machine. The message is processed as user input by the peer's agent.
 
-- Project scope by default: \`action: "list"\` and sends only see sessions in this same project (sessions whose git repo root matches this session's). Sessions in other projects are hidden. To list or message sessions in any project on this machine, pass \`scope: "all"\`.
+- Project scope by default: \`action: "list"\` and sends only see sessions in this same project (sessions whose git repo root matches this session's). Sessions in other projects are hidden from you; only widen with \`scope: "all"\` when the user explicitly asks to reach a session in another project.
 - To discover peers, call with \`action: "list"\` — you get each live session's name, status, kind, working directory, and disambiguation ref. You do not need the user to tell you peer names.
 - When you RECEIVE a \`<cross-session-message from="ADDRESS" from-name="X" …>\` in your context, that is a message from peer X. If it asks for a reply or reports results back, you MUST answer by calling this tool — \`to\` accepts the message's \`from\` address verbatim, or the sender's name. Writing the answer only in your local chat never reaches the sender — they cannot see your screen.
-- A send failing with "belongs to another project" is a scoping block, not a missing peer: resend with \`scope: "all"\` to message across projects.
+- A send failing with "belongs to another project" is a scoping block, not a missing peer: the target exists in another project; resend with \`scope: "all"\` only if the user asked to reach that session.
 - If several sessions share one name, the send fails with a candidate list; resend with "name [ref]" to disambiguate, e.g. "alice [ab12cd]".
 - \`priority\`: "next" (default) queues the message until the peer's current work finishes; "now" interrupts the peer immediately. Use "now" sparingly.
 - \`notifyWhenIdle\`: also subscribes (once) to be notified when the peer next becomes idle.
@@ -123,15 +123,13 @@ function listLivePeers(
 	const entries = scope === "all" ? live : live.filter((entry) => sameProject(entry));
 	const hidden = live.length - entries.length;
 	if (entries.length === 0) {
-		return hidden > 0
-			? `No live peers in this project.\n(+${hidden} sessions in other projects hidden; pass scope: "all" to include)`
-			: "No live peers.";
+		return hidden > 0 ? `No live peers in this project. (+${hidden} in other projects)` : "No live peers.";
 	}
 	const lines = entries.map((entry) =>
 		peerLine(entry.record, registry.refOf(entry.record), entry.record.pid === selfPid),
 	);
 	if (hidden > 0) {
-		lines.push(`(+${hidden} sessions in other projects hidden; pass scope: "all" to include)`);
+		lines.push(`(+${hidden} in other projects)`);
 	}
 	return lines.join("\n");
 }
