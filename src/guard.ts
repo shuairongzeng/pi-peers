@@ -9,6 +9,12 @@
  * token from it regardless of sender, so rotating the attacker-controlled `from` string can't
  * hand each message a fresh per-sender bucket. Dedup stays per-sender.
  *
+ * checkChild() gates CHILD-class frames (subagents authenticated with the child token): rate
+ * limiting only — no dedupe, hop, or queue policing. Unlike check() it consumes its tokens on
+ * success, because child frames bypass the accept pipeline and no recordAccepted() runs for
+ * them. Child traffic draws from a generous dedicated bucket and from the global aggregate
+ * bucket, so a misbehaving child can flood neither the parent nor the aggregate cap.
+ *
  * Per-sender state (token bucket + dedup fingerprints) is LRU-capped at
  * PEER_MAX_TRACKED_SENDERS: when a new sender arrives over the cap, the least recently used
  * sender is evicted with all its state, so a returning sender starts fresh.
@@ -31,6 +37,11 @@ export const PEER_GLOBAL_RATE_CAPACITY = 120;
 /** Aggregate inbound refill (tokens/sec), prorated per elapsed millisecond. */
 export const PEER_GLOBAL_RATE_REFILL_PER_SEC = 2;
 
+/** Child-class inbound cap: tokens shared by ALL child frames (checkChild). */
+export const PEER_CHILD_RATE_CAPACITY = 120;
+/** Child-class refill (tokens/sec), prorated per elapsed millisecond. */
+export const PEER_CHILD_RATE_REFILL_PER_SEC = 10;
+
 // ---------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------
@@ -47,6 +58,10 @@ export interface PeerGuardOptions {
 	globalRateCapacity?: number;
 	/** Aggregate refill (tokens/sec) shared by all senders. Defaults to PEER_GLOBAL_RATE_REFILL_PER_SEC. */
 	globalRateRefillPerSec?: number;
+	/** Child-class bucket capacity shared by all child frames (checkChild). Defaults to PEER_CHILD_RATE_CAPACITY. */
+	childRateCapacity?: number;
+	/** Child-class refill (tokens/sec), prorated per elapsed millisecond. Defaults to PEER_CHILD_RATE_REFILL_PER_SEC. */
+	childRateRefillPerSec?: number;
 	/** How long a content fingerprint suppresses re-delivery. Defaults to PEER_DEDUP_WINDOW_MS. */
 	dedupWindowMs?: number;
 	/** Max occurrences of our own hop token in a hopChain. Defaults to PEER_MAX_SELF_HOPS. */
@@ -103,12 +118,17 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 	const maxTrackedSenders = opts.maxTrackedSenders ?? PEER_MAX_TRACKED_SENDERS;
 	const globalRateCapacity = opts.globalRateCapacity ?? PEER_GLOBAL_RATE_CAPACITY;
 	const globalRateRefillPerSec = opts.globalRateRefillPerSec ?? PEER_GLOBAL_RATE_REFILL_PER_SEC;
+	const childRateCapacity = opts.childRateCapacity ?? PEER_CHILD_RATE_CAPACITY;
+	const childRateRefillPerSec = opts.childRateRefillPerSec ?? PEER_CHILD_RATE_REFILL_PER_SEC;
 
 	/** Insertion-ordered; first key = least recently used, re-inserting a key refreshes recency. */
 	const senders = new Map<string, SenderState>();
 
 	/** Aggregate bucket consumed by every accepted user frame, regardless of sender. */
 	const globalBucket: TokenBucket = { tokens: globalRateCapacity, lastRefillMs: now() };
+
+	/** Bucket shared by every child-class frame; children skip dedupe/hops/queue but not this. */
+	const childBucket: TokenBucket = { tokens: childRateCapacity, lastRefillMs: now() };
 
 	function check(fromKey: string, frame: PeerUserFrame, ownHopToken: string, queuedCount: number): PeerGuardCheck {
 		if (queuedCount >= maxQueued) {
@@ -143,6 +163,30 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 			// Aggregate cap: rotating `from` cannot hand each message a fresh bucket.
 			return { ok: false, reason: "rate-limited" };
 		}
+		return { ok: true };
+	}
+
+	/**
+	 * Check-and-consume gate for child-class frames: they skip the accept pipeline, so no
+	 * recordAccepted() will ever run for them and the token is charged here, on success only.
+	 * The bucket is class-wide; `fromKey` exists for interface parity and future per-child
+	 * scoping.
+	 */
+	function checkChild(fromKey: string): PeerGuardCheck {
+		const atMs = now();
+		const childTokens = tokensAt(childBucket, atMs, childRateCapacity, childRateRefillPerSec);
+		if (childTokens < 1) {
+			return { ok: false, reason: "rate-limited" };
+		}
+		// The aggregate cap binds children too: they cannot bypass the global bucket.
+		const globalTokens = tokensAt(globalBucket, atMs, globalRateCapacity, globalRateRefillPerSec);
+		if (globalTokens < 1) {
+			return { ok: false, reason: "rate-limited" };
+		}
+		childBucket.tokens = Math.max(0, childTokens - 1);
+		childBucket.lastRefillMs = atMs;
+		globalBucket.tokens = Math.max(0, globalTokens - 1);
+		globalBucket.lastRefillMs = atMs;
 		return { ok: true };
 	}
 
@@ -185,7 +229,7 @@ export function createPeerGuard(opts: PeerGuardOptions = {}): PeerGuard {
 		globalBucket.lastRefillMs = atMs;
 	}
 
-	return { check, recordAccepted, refund };
+	return { check, recordAccepted, refund, checkChild };
 }
 
 // ---------------------------------------------------------------------------

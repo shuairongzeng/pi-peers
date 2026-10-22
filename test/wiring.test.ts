@@ -504,6 +504,17 @@ describe("peers plugin wiring (dual-host)", () => {
 		}
 	});
 
+	it("agent_start during the session_start async gap still publishes busy", async () => {
+		const { pi, handlers } = createFakePi();
+		peersExtension(pi);
+		const ctx = createFakeCtx(peersDir, { isIdle: () => true });
+		// Fire agent_start BEFORE session_start completes (the handler awaits
+		// listen + git probe): the busy status must survive into the record.
+		await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+		expect(readOwnRecord().status).toBe("busy");
+	});
+
 	it("PI_PEERS_NAME wins over derived naming and stamps nameSource=env", async () => {
 		process.env.PI_PEERS_NAME = "Researcher Bot";
 		try {

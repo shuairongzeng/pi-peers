@@ -265,6 +265,87 @@ describe("createPeerGuard", () => {
 			expect(guard.check("b", makeFrame({ content: "z" }), "self", 0).reason).toBe("rate-limited");
 		});
 	});
+
+	describe("checkChild (child-class rate limit)", () => {
+		it("admits a burst of 120 child frames, rate-limits the 121st within a second", () => {
+			const guard = createPeerGuard({ now });
+			for (let i = 0; i < 120; i++) {
+				expect(guard.checkChild("child-1")).toEqual({ ok: true });
+			}
+			// Child bucket (capacity 120, refill 10/sec) is drained at clock=1000.
+			expect(guard.checkChild("child-1")).toEqual({ ok: false, reason: "rate-limited" });
+		});
+
+		it("refill re-admits a child frame after the 121st is refused", () => {
+			const guard = createPeerGuard({ now });
+			for (let i = 0; i < 120; i++) {
+				guard.checkChild("child-1");
+			}
+			expect(guard.checkChild("child-1").reason).toBe("rate-limited");
+			// Child refill is 10/sec but the global refills at only 2/sec: after draining both
+			// buckets, the global gate needs 500ms for one token.
+			clock += MS_PER_TOKEN(2);
+			expect(guard.checkChild("child-1")).toEqual({ ok: true });
+			// The single refilled token is consumed; the next is still limited.
+			expect(guard.checkChild("child-1").reason).toBe("rate-limited");
+		});
+
+		it("ignores fromKey and shared by all children (no dedupe, no per-child scoping)", () => {
+			const guard = createPeerGuard({ now });
+			// 60 frames from each of two children drain one class-wide bucket.
+			for (let i = 0; i < 60; i++) {
+				expect(guard.checkChild("child-1")).toEqual({ ok: true });
+				expect(guard.checkChild("child-2")).toEqual({ ok: true });
+			}
+			expect(guard.checkChild("child-3").reason).toBe("rate-limited");
+		});
+
+		it("child consumption also drains the global bucket", () => {
+			const guard = createPeerGuard({ now });
+			// 120 child frames empty the class-wide child bucket; each also drew a global token.
+			for (let i = 0; i < 120; i++) {
+				guard.checkChild("child-1");
+			}
+			// A peer frame from a fresh sender passes its own bucket but the global one is dry.
+			expect(guard.check("peer-1", makeFrame({ content: "c" }), "self", 0)).toEqual({
+				ok: false,
+				reason: "rate-limited",
+			});
+		});
+
+		it("combined child+peer traffic exhausts the global bucket, not the per-sender one", () => {
+			const guard = createPeerGuard({ now });
+			// 110 child frames leave only 10 global tokens; a peer still inside its 30-token
+			// per-sender budget (PEER_RATE_CAPACITY) gets cut by the aggregate cap. No time
+			// passes at clock=1000 across the consumptions, so refill stays out of the picture.
+			for (let i = 0; i < 110; i++) {
+				guard.checkChild("child-1");
+			}
+			for (let i = 0; i < 10; i++) {
+				expect(guard.check("peer-1", makeFrame({ content: `m${i}` }), "self", 0)).toEqual({ ok: true });
+				guard.recordAccepted("peer-1", makeFrame({ content: `m${i}` }));
+			}
+			// peer-1 has consumed only 10 of its 30 per-sender tokens; the global bucket is dry.
+			expect(guard.check("peer-1", makeFrame({ content: "m10" }), "self", 0)).toEqual({
+				ok: false,
+				reason: "rate-limited",
+			});
+		});
+
+		it("child tokens refill independently of the global bucket", () => {
+			// Grow the global budget so only the child bucket can be the binding constraint.
+			const guard = createPeerGuard({ now, globalRateCapacity: 1000 });
+			for (let i = 0; i < 120; i++) {
+				guard.checkChild("child-1");
+			}
+			expect(guard.checkChild("child-1").reason).toBe("rate-limited");
+			// Child refill: 10 tokens/sec → 1 token needs 100ms (the global still has plenty).
+			clock += MS_PER_TOKEN(10);
+			expect(guard.checkChild("child-1")).toEqual({ ok: true });
+			// The single refilled token is consumed; the next is still limited.
+			expect(guard.checkChild("child-1").reason).toBe("rate-limited");
+		});
+	});
 });
 
 describe("createPeerSenderPacer", () => {

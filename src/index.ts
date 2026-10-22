@@ -182,6 +182,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	// session_start (computeProjectRoot is async; publishRecord() is a sync
 	// call site).
 	let projectRoot: string | undefined;
+	// Event-ordered status: agent_start/agent-settled record the intended status
+	// here so publishRecord() (which runs after an async gap in session_start)
+	// stamps the latest reality instead of re-deriving it from a racy isIdle().
+	let lastKnownStatus: "busy" | "idle" | undefined;
 	const formerNames: { name: string; until: string }[] = [];
 
 	const host: PeerHost = {
@@ -299,7 +303,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			nameSource: envName ? "env" : sessionName !== undefined ? "user" : "derived",
 			formerNames: [...formerNames],
 			kind: mapModeToKind(ctx.mode),
-			status: ctx.isIdle() ? "idle" : "busy",
+			status: lastKnownStatus ?? (ctx.isIdle() ? "idle" : "busy"),
 			statusUpdatedAt: Date.now(),
 			startedAt: Date.now(),
 			procStart: registry.readProcStart(process.pid),
@@ -315,6 +319,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	};
 
 	const setStatus = (status: "busy" | "idle"): void => {
+		lastKnownStatus = status;
 		if (record === undefined) return;
 		const usage = ctx?.getContextUsage?.();
 		record = { ...record, status, statusUpdatedAt: Date.now(), ...(usage !== undefined ? { contextUsage: usage } : {}) };

@@ -20,8 +20,12 @@ import {
 	type PeerMessageStatusFrame,
 	type PeerOutbox,
 	type PeerReceiptState,
+	type PeerRecord,
 	type PeerServiceDeps,
+	type PeerShutdownFrame,
+	type PeerShutdownResponseFrame,
 	type PeerUserFrame,
+	sameProject,
 } from "./types.ts";
 
 // ---------------------------------------------------------------------------
@@ -33,7 +37,14 @@ interface IdleSub {
 	from: string;
 	fromName: string | undefined;
 	nonce: string | undefined;
+	/** ms epoch when the subscription was parked (TTL hygiene). */
+	atMs: number;
 }
+
+/** How long a parked notify_when_idle subscription survives before eviction. */
+const IDLE_SUB_TTL_MS = 30 * 60_000;
+/** Max parked subscriptions; the oldest is evicted beyond this (leak cap). */
+const IDLE_SUB_MAX = 64;
 
 /** Max chars of the body preview shown in approval prompts. */
 const PREVIEW_MAX_CHARS = 500;
@@ -85,6 +96,146 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	}
 
 	/**
+	 * Parked-subscription hygiene: drop entries older than IDLE_SUB_TTL_MS and
+	 * cap the map at IDLE_SUB_MAX (evicting the oldest by atMs). A re-sent
+	 * msg_id re-sets its atMs in place, so insertion order is not strictly age
+	 * order — the map is bounded (~IDLE_SUB_MAX entries), a full scan is cheap.
+	 */
+	function evictIdleSubs(): void {
+		const now = Date.now();
+		for (const [key, sub] of idleSubs) {
+			if (now - sub.atMs >= IDLE_SUB_TTL_MS) {
+				idleSubs.delete(key);
+			}
+		}
+		while (idleSubs.size > IDLE_SUB_MAX) {
+			const oldest = [...idleSubs.entries()].reduce((a, b) => (b[1].atMs < a[1].atMs ? b : a));
+			idleSubs.delete(oldest[0]);
+		}
+	}
+
+	/**
+	 * Convert a wire address (`pipe:LOCAL\X` / `sock:<path>`) to the canonical
+	 * connect-path form stored in PeerRecord.socketPath, so registry entries can
+	 * be matched against frame senders and our own identity.
+	 */
+	function addressToSocketPath(address: string): string | undefined {
+		if (address.startsWith("pipe:")) {
+			return `\\\\.\\pipe\\${address.slice("pipe:".length)}`;
+		}
+		if (address.startsWith("sock:")) {
+			return address.slice("sock:".length);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Peer-record lookup by wire address: entries whose record.socketPath
+	 * converts back to the given address. Live-only — a dead sender's record is
+	 * not a trustworthy project scope.
+	 */
+	function recordForAddress(address: string): PeerRecord | undefined {
+		const socketPath = addressToSocketPath(address);
+		if (socketPath === undefined) return undefined;
+		const found = deps.registry.list().find((e) => e.live && e.record.socketPath === socketPath);
+		return found?.record;
+	}
+
+	/**
+	 * Receiver-side project scope for policy "all" shutdowns: a cross-project
+	 * sender must not silently kill us. Same-project, unknown sender (registry
+	 * race: benefit of the doubt under "all"), or a missing own record are all
+	 * treated as same-project.
+	 */
+	function isCrossProjectShutdown(frame: PeerShutdownFrame): boolean {
+		const sender = recordForAddress(frame.from);
+		if (sender === undefined) return false;
+		const own = recordForAddress(identity.socketAddress);
+		if (own === undefined) return false;
+		return !sameProject(sender, own);
+	}
+
+	/**
+	 * Send the shutdown_response answer back to the sender. Best-effort like
+	 * every receipt: a failure must not block (or crash) shutdown handling.
+	 */
+	async function sendShutdownResponse(
+		frame: PeerShutdownFrame,
+		outcome: "accepted" | "denied",
+		reason: string | undefined,
+	): Promise<void> {
+		const responseFrame: PeerShutdownResponseFrame = {
+			...protocol.newEnvelope(),
+			type: "control",
+			action: "shutdown_response",
+			inReplyTo: frame.msg_id,
+			from: identity.socketAddress,
+			...(identity.name !== "" ? { fromName: identity.name } : {}),
+			outcome,
+			...(reason !== undefined ? { reason } : {}),
+		};
+		try {
+			await deps.outbox.sendControl(frame.from, responseFrame);
+		} catch {
+			// The real outbox already logs transport failures; the outcome
+			// below (notify + quit) must proceed regardless.
+		}
+	}
+
+	/**
+	 * Decide the outcome of a peer shutdown request per the accept policy.
+	 * Returns "accepted" plus a reason for the response frame; the caller sends
+	 * the response and performs notify + quit only on acceptance.
+	 */
+	async function decideShutdown(
+		frame: PeerShutdownFrame,
+	): Promise<{ outcome: "accepted" | "denied"; reason?: string }> {
+		const policy = host.acceptPolicy();
+		if (policy === "off") {
+			return { outcome: "denied", reason: "accept policy off" };
+		}
+		if (policy === "ask") {
+			const fromName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+			const sender =
+				frame.fromName === undefined ? fromName : `"${fromName}" (${protocol.sanitizePeerText(frame.from)})`;
+			const reason =
+				frame.reason === undefined ? "" : `\nReason: ${protocol.sanitizePeerText(frame.reason)}`;
+			const answer = await host.confirm(
+				"Peer shutdown request",
+				`Peer ${sender} asks to shut down this session.${reason}`,
+				PEER_APPROVAL_TIMEOUT_MS,
+			);
+			if (answer === "no") {
+				return { outcome: "denied", reason: "user declined" };
+			}
+			if (answer === "timeout") {
+				return { outcome: "denied", reason: "confirmation timed out" };
+			}
+			return { outcome: "accepted" };
+		}
+		// policy === "all": still refuse cross-project senders unless a human
+		// confirms (headless sessions refuse outright).
+		if (isCrossProjectShutdown(frame)) {
+			if (!host.hasUI()) {
+				return { outcome: "denied", reason: "cross-project refused" };
+			}
+			const answer = await host.confirm(
+				"Peer shutdown request",
+				`Peer ${protocol.sanitizePeerText(frame.fromName ?? frame.from)} from another project asks to shut down this session.`,
+				PEER_APPROVAL_TIMEOUT_MS,
+			);
+			if (answer === "no") {
+				return { outcome: "denied", reason: "cross-project refused" };
+			}
+			if (answer === "timeout") {
+				return { outcome: "denied", reason: "confirmation timed out" };
+			}
+			return { outcome: "accepted" };
+		}
+		return { outcome: "accepted" };
+	}
+
+	/**
 	 * Route one inbound user frame through wrapper validation → guard → accept
 	 * policy → injection. Receipts are sent via the outbox (best-effort by
 	 * contract) and failures there never mask the outcome of the message itself.
@@ -111,6 +262,13 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 		);
 
 		if (senderClass === "child") {
+			// Child frames skip the accept pipeline but not the child rate
+			// limit: a flooding child is dropped silently (no receipt — a
+			// child has no listener to receive one) rather than injected.
+			const verdict = guard.checkChild(frame.from);
+			if (!verdict.ok) {
+				return;
+			}
 			await inject(frame, content, senderClass);
 			return;
 		}
@@ -200,20 +358,22 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 					// that would only flush on a future busy→idle transition.
 					sendIdleNotice({
 						replyTo: frame.reply_to,
-						from: frame.from,
-						fromName: frame.fromName,
 						nonce: frame.nonce,
 					});
 					return;
 				}
-				idleSubs.set(frame.msg_id, {
-					replyTo: frame.reply_to,
-					from: frame.from,
-					fromName: frame.fromName,
-					nonce: frame.nonce,
-				});
-				return;
-			}
+			idleSubs.set(frame.msg_id, {
+				replyTo: frame.reply_to,
+				from: frame.from,
+				fromName: frame.fromName,
+				nonce: frame.nonce,
+				atMs: Date.now(),
+			});
+			// Parked-subscription hygiene: a busy stretch must not accumulate
+			// an unbounded Map of dead peers' subscriptions.
+			evictIdleSubs();
+			return;
+		}
 		case "peer_idle_notice": {
 			// One-shot nonce: unsolicited, reused, or missing nonces are dropped
 			// silently — only notices answering our subscription get through.
@@ -225,33 +385,28 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			return;
 		}
 		case "shutdown": {
-			// Peer-requested shutdown of this session. The host's quit path
-			// triggers session_shutdown (unpublish + server teardown); the
-			// inbox never tears down transport state itself.
-			const policy = host.acceptPolicy();
-			if (policy === "off") {
-				return;
-			}
-			if (policy === "ask") {
-				const fromName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
-				const sender =
-					frame.fromName === undefined ? fromName : `"${fromName}" (${protocol.sanitizePeerText(frame.from)})`;
-				const reason =
-					frame.reason === undefined ? "" : `\nReason: ${protocol.sanitizePeerText(frame.reason)}`;
-				const answer = await host.confirm(
-					"Peer shutdown request",
-					`Peer ${sender} asks to shut down this session.${reason}`,
-					PEER_APPROVAL_TIMEOUT_MS,
+			// Peer-requested shutdown of this session. Every branch answers the
+			// sender with a shutdown_response frame first; the host's quit path
+			// (only on "accepted") triggers session_shutdown (unpublish + server
+			// teardown); the inbox never tears down transport state itself.
+			const outcome = await decideShutdown(frame);
+			await sendShutdownResponse(frame, outcome.outcome, outcome.reason);
+			if (outcome.outcome === "accepted") {
+				host.notify(
+					"peers",
+					`Shutting down at request of peer ${protocol.sanitizePeerText(frame.fromName ?? frame.from)}`,
 				);
-				if (answer !== "yes") {
-					return;
-				}
+				host.quit();
 			}
-			host.notify(
-				"peers",
-				`Shutting down at request of peer ${protocol.sanitizePeerText(frame.fromName ?? frame.from)}`,
-			);
-			host.quit();
+			return;
+		}
+		case "shutdown_response": {
+			// Answer to a shutdown we requested: the requesting agent learns the
+			// outcome (agent notice) and the user gets a toast.
+			const peerName = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+			const text = `Peer "${peerName}" ${frame.outcome === "accepted" ? "accepted" : "denied"} the shutdown request${frame.reason === undefined ? "" : ` (${protocol.sanitizePeerText(frame.reason)})`}.`;
+			host.notify("peers", text);
+			await host.injectAgentNotice(text);
 			return;
 		}
 	}
@@ -270,7 +425,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	 * busy→idle flush (onIdle) and the already-idle immediate path so both
 	 * produce identical frames; sendControl is best-effort by contract.
 	 */
-	function sendIdleNotice(sub: IdleSub): void {
+	function sendIdleNotice(sub: Pick<IdleSub, "replyTo" | "nonce">): void {
 		const notice: PeerIdleNoticeFrame = {
 			...protocol.newEnvelope(),
 			type: "control",

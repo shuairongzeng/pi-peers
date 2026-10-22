@@ -338,7 +338,19 @@ export interface PeerShutdownFrame extends PeerEnvelope {
 	reason?: string;
 }
 
-export type PeerControlFrame = PeerMessageStatusFrame | PeerNotifyWhenIdleFrame | PeerIdleNoticeFrame | PeerShutdownFrame;
+export interface PeerShutdownResponseFrame extends PeerEnvelope {
+	type: "control";
+	action: "shutdown_response";
+	/** msg_id of the shutdown frame this answers. */
+	inReplyTo: string;
+	from: string;
+	fromName?: string;
+	/** accepted = quitting now; denied = user/policy refused. */
+	outcome: "accepted" | "denied";
+	reason?: string;
+}
+
+export type PeerControlFrame = PeerMessageStatusFrame | PeerNotifyWhenIdleFrame | PeerIdleNoticeFrame | PeerShutdownFrame | PeerShutdownResponseFrame;
 export type PeerFrame = PeerUserFrame | PeerControlFrame;
 
 // ---------------------------------------------------------------------------
@@ -548,6 +560,12 @@ export interface PeerGuard {
 	recordAccepted(fromKey: string, frame: PeerUserFrame): void;
 	/** Forget a sender that failed to deliver (rate-token refund). */
 	refund(fromKey: string): void;
+	/**
+	 * Inbound check for a CHILD-class frame (subagent authenticated with the
+	 * child token). Skips dedupe/hop-chain/consent but still rate-limits
+	 * (generous child bucket) so a misbehaving child cannot flood the parent.
+	 */
+	checkChild(fromKey: string): PeerGuardCheck;
 }
 
 export interface PeerSenderPacer {

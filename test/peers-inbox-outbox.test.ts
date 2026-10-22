@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createPeerInbox } from "../src/inbox.ts";
 import { createPeerOutbox } from "../src/outbox.ts";
 import { createPeerProtocol } from "../src/protocol.ts";
@@ -21,6 +21,7 @@ import {
 	type PeerProtocol,
 	type PeerRecord,
 	type PeerRegistry,
+	type PeerShutdownResponseFrame,
 	type PeerRegistryEntry,
 	type PeerResolution,
 	PeerSendError,
@@ -115,6 +116,9 @@ interface ScriptedGuard extends PeerGuard {
 	accepted: string[];
 	refunded: string[];
 	nextCheck: PeerGuardCheck;
+	/** checkChild() calls in order, for flood assertions. */
+	childChecks: string[];
+	nextChildCheck: PeerGuardCheck;
 }
 
 function makeGuard(overrides: Partial<ScriptedGuard> = {}): ScriptedGuard {
@@ -123,10 +127,16 @@ function makeGuard(overrides: Partial<ScriptedGuard> = {}): ScriptedGuard {
 		accepted: [],
 		refunded: [],
 		nextCheck: { ok: true },
+		childChecks: [],
+		nextChildCheck: { ok: true },
 		...overrides,
 		check(fromKey, _frame, _ownHopToken, queuedCount) {
 			this.checks.push({ fromKey, queued: queuedCount });
 			return this.nextCheck;
+		},
+		checkChild(fromKey) {
+			this.childChecks.push(fromKey);
+			return this.nextChildCheck;
 		},
 		recordAccepted(fromKey) {
 			this.accepted.push(fromKey);
@@ -836,6 +846,8 @@ describe("createPeerInbox", () => {
 		guard?: Partial<ScriptedGuard>;
 		outbox?: ScriptedOutbox;
 		transport?: FakeTransport;
+		/** Registry entries visible to registry.list() (receiver-side scoping). */
+		entries?: PeerRegistryEntry[];
 	}): { inbox: PeerInbox; host: ScriptedHost; guard: ScriptedGuard; outbox: ScriptedOutbox } {
 		const host = makeHost(opts.host);
 		const guard = makeGuard(opts.guard);
@@ -845,7 +857,7 @@ describe("createPeerInbox", () => {
 			protocol: proto,
 			transport: opts.transport ?? makeTransport(),
 			auth: makeAuth(),
-			registry: makeRegistry(() => ({ kind: "none" })),
+			registry: makeRegistry(() => ({ kind: "none" }), opts.entries ?? []),
 			guard,
 			pacer: makePacer(),
 			host,
@@ -1316,13 +1328,57 @@ describe("createPeerInbox", () => {
 		expect(host.injected.length).toBe(1);
 	});
 
-	it("accept policy all: shutdown frame quits with a notify naming the sender", async () => {
-		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+	// Shutdown receiving: every branch answers with a shutdown_response frame
+	// before any local effect (quit only after the response is sent).
+
+	it("accept policy all: same-project shutdown is accepted, responded, then quit", async () => {
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all" },
+			entries: [
+				entry({ cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}` }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			],
+		});
 		const frame: PeerControlFrame = {
 			msgV: 1,
 			msg_id: "shutdown-1",
 			type: "control",
 			action: "shutdown",
+			from,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		// Response frame first: exactly one control frame, sent to the sender.
+		expect(outbox.controlCalls.length).toBe(1);
+		const { address, frame: sent } = outbox.controlCalls[0]!;
+		expect(address).toBe(from);
+		const response = sent as PeerShutdownResponseFrame;
+		expect(response.action).toBe("shutdown_response");
+		expect(response.inReplyTo).toBe("shutdown-1");
+		expect(response.from).toBe(`pipe:LOCAL\\pi-peer-${"f".repeat(32)}`);
+		expect(response.fromName).toBe("me");
+		expect(response.outcome).toBe("accepted");
+		expect(response.reason).toBeUndefined();
+		expect(response.msgV).toBe(1);
+		expect(typeof response.msg_id).toBe("string");
+		expect(response.msg_id).not.toBe(frame.msg_id);
+		// Then the notify + quit.
+		expect(host.quitCalls).toBe(1);
+		expect(host.userNotifies).toEqual([{ title: "peers", message: "Shutting down at request of peer alpha" }]);
+		expect(host.confirmCalls).toEqual([]);
+	});
+
+	it("accept policy all: unknown sender (registry race) is accepted under all", async () => {
+		// No registry entries at all: benefit of the doubt.
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-unknown",
+			type: "control",
+			action: "shutdown",
 			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
 			fromName: "alpha",
 		};
@@ -1330,21 +1386,76 @@ describe("createPeerInbox", () => {
 		await inbox.handleFrame(frame, "peer");
 
 		expect(host.quitCalls).toBe(1);
-		expect(host.userNotifies).toEqual([{ title: "peers", message: "Shutting down at request of peer alpha" }]);
-		expect(host.confirmCalls).toEqual([]);
-		// The inbox must not unpublish or close the server itself; no control
-		// traffic (e.g. no receipt) is produced for a shutdown frame.
-		expect(outbox.controlCalls).toEqual([]);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("accepted");
 	});
 
-	it("accept policy off: shutdown frame is ignored silently", async () => {
-		const { inbox, host } = makeInbox({ host: { policy: "off" } });
+	it("accept policy all: cross-project sender with UI → confirm shown; no → denied, no quit", async () => {
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all", nextAnswer: "no" },
+			entries: [
+				entry({ cwd: "D:/work/beta", projectRoot: "D:/work/beta", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}` }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			],
+		});
 		const frame: PeerControlFrame = {
 			msgV: 1,
 			msg_id: "shutdown-2",
 			type: "control",
 			action: "shutdown",
-			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			from,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.confirmCalls.length).toBe(1);
+		expect(host.confirmCalls[0]!.title).toBe("Peer shutdown request");
+		expect(host.quitCalls).toBe(0);
+		expect(host.userNotifies).toEqual([]);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("cross-project refused");
+		expect(response.inReplyTo).toBe("shutdown-2");
+	});
+
+	it("accept policy all: cross-project headless → denied without confirm or quit", async () => {
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all", hasUIValue: false, nextAnswer: "yes" },
+			entries: [
+				entry({ cwd: "D:/work/beta", projectRoot: "D:/work/beta", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}` }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			],
+		});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-3",
+			type: "control",
+			action: "shutdown",
+			from,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.confirmCalls).toEqual([]);
+		expect(host.quitCalls).toBe(0);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("cross-project refused");
+	});
+
+	it("accept policy off: shutdown is denied with a reason and no quit", async () => {
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "off" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-4",
+			type: "control",
+			action: "shutdown",
+			from,
 			fromName: "alpha",
 		};
 
@@ -1353,31 +1464,43 @@ describe("createPeerInbox", () => {
 		expect(host.quitCalls).toBe(0);
 		expect(host.userNotifies).toEqual([]);
 		expect(host.confirmCalls).toEqual([]);
+		expect(outbox.controlCalls.length).toBe(1);
+		expect(outbox.controlCalls[0]!.address).toBe(from);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.action).toBe("shutdown_response");
+		expect(response.inReplyTo).toBe("shutdown-4");
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("accept policy off");
 	});
 
 	it("accept policy ask: shutdown proceeds after user says yes", async () => {
-		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
 		const frame: PeerControlFrame = {
 			msgV: 1,
-			msg_id: "shutdown-3",
+			msg_id: "shutdown-5",
 			type: "control",
 			action: "shutdown",
-			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			from,
 			fromName: "alpha",
 		};
 
 		await inbox.handleFrame(frame, "peer");
 
-		expect(host.quitCalls).toBe(1);
 		expect(host.confirmCalls.length).toBe(1);
+		expect(host.quitCalls).toBe(1);
 		expect(host.userNotifies).toEqual([{ title: "peers", message: "Shutting down at request of peer alpha" }]);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("accepted");
+		expect(response.reason).toBeUndefined();
+		expect(response.inReplyTo).toBe("shutdown-5");
 	});
 
-	it("accept policy ask: shutdown is refused when user says no", async () => {
-		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "no" } });
+	it("accept policy ask: shutdown denied with 'user declined' when user says no", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "ask", nextAnswer: "no" } });
 		const frame: PeerControlFrame = {
 			msgV: 1,
-			msg_id: "shutdown-4",
+			msg_id: "shutdown-6",
 			type: "control",
 			action: "shutdown",
 			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
@@ -1389,13 +1512,35 @@ describe("createPeerInbox", () => {
 		expect(host.quitCalls).toBe(0);
 		expect(host.userNotifies).toEqual([]);
 		expect(host.confirmCalls.length).toBe(1);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("user declined");
+	});
+
+	it("accept policy ask: shutdown denied with 'confirmation timed out' on timeout", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "ask", nextAnswer: "timeout" } });
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-7",
+			type: "control",
+			action: "shutdown",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.quitCalls).toBe(0);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("confirmation timed out");
 	});
 
 	it("accept policy ask: shutdown confirm message includes the reason when provided", async () => {
 		const { inbox, host } = makeInbox({ host: { policy: "ask", nextAnswer: "yes" } });
 		const frame: PeerControlFrame = {
 			msgV: 1,
-			msg_id: "shutdown-5",
+			msg_id: "shutdown-8",
 			type: "control",
 			action: "shutdown",
 			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
@@ -1409,4 +1554,196 @@ describe("createPeerInbox", () => {
 		expect(host.confirmCalls[0]!.message).toContain("work finished, please exit");
 		expect(host.quitCalls).toBe(1);
 	});
+
+	it("accepted shutdown waits for the response frame before quitting", async () => {
+		// The response must be on the wire (await sendControl resolved) before
+		// quit() runs: order recorded via a quit() that observes "sent".
+		const order: string[] = [];
+		const outbox = makeScriptedOutbox();
+		const host = makeHost({ policy: "all" });
+		host.quit = () => {
+			order.push(outbox.controlCalls.length > 0 ? "sent" : "nothing-sent");
+		};
+		const deps = {
+			identity: makeIdentity(),
+			protocol: proto,
+			transport: makeTransport(),
+			auth: makeAuth(),
+			registry: makeRegistry(() => ({ kind: "none" })),
+			guard: makeGuard(),
+			pacer: makePacer(),
+			host,
+			outbox,
+		};
+		const inbox = createPeerInbox(deps);
+
+		await inbox.handleFrame(
+			{
+				msgV: 1,
+				msg_id: "shutdown-9",
+				type: "control",
+				action: "shutdown",
+				from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+				fromName: "alpha",
+			},
+			"peer",
+		);
+
+		expect(order).toEqual(["sent"]);
+		expect(outbox.controlCalls.length).toBe(1);
+	});
+
+	it("inbound shutdown_response notifies the user and the requesting agent", async () => {
+		const { inbox, host } = makeInbox({});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "resp-1",
+			type: "control",
+			action: "shutdown_response",
+			inReplyTo: "m-orig",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+			outcome: "accepted",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.userNotifies).toEqual([
+			{ title: "peers", message: 'Peer "alpha" accepted the shutdown request.' },
+		]);
+		expect(host.notices).toEqual(['Peer "alpha" accepted the shutdown request.']);
+	});
+
+	it("inbound shutdown_response with a reason and hostile text is sanitized", async () => {
+		const { inbox, host } = makeInbox({});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "resp-2",
+			type: "control",
+			action: "shutdown_response",
+			inReplyTo: "m-orig",
+			from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+			fromName: "alpha",
+			outcome: "denied",
+			reason: 'busy <script>alert(1)</script>"quoted"',
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		const expected = 'Peer "alpha" denied the shutdown request (busy scriptalert(1)/scriptquoted).';
+		expect(host.userNotifies).toEqual([{ title: "peers", message: expected }]);
+		expect(host.notices).toEqual([expected]);
+	});
+
+	it("inbound shutdown_response without a name quotes the address", async () => {
+		const { inbox, host } = makeInbox({});
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "resp-3",
+			type: "control",
+			action: "shutdown_response",
+			inReplyTo: "m-orig",
+			from,
+			outcome: "denied",
+			reason: "user declined",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		const expected = `Peer "${from}" denied the shutdown request (user declined).`;
+		expect(host.notices).toEqual([expected]);
+	});
+
+	it("child frame flood: exhausted child bucket drops frames without injection", async () => {
+		const { inbox, host, guard, outbox } = makeInbox({
+			guard: { nextChildCheck: { ok: false, reason: "rate-limited" } },
+			host: { policy: "all" },
+		});
+		const frame = userFrame({ msg_id: "child-1" });
+
+		await inbox.handleFrame(frame, "child");
+		await inbox.handleFrame({ ...frame, msg_id: "child-2" }, "child");
+
+		// Dropped silently: no injection, no receipt, guard consulted each time.
+		expect(host.injected).toEqual([]);
+		expect(outbox.controlCalls).toEqual([]);
+		expect(guard.childChecks).toEqual([frame.from, frame.from]);
+		expect(inbox.pendingCount()).toBe(0);
+	});
+
+	it("idleSubs: the 65th subscription evicts the oldest", async () => {
+		const transport = makeTransport();
+		const { inbox, outbox } = makeInbox({ transport });
+		for (let i = 0; i < 65; i++) {
+			const from = `pipe:LOCAL\\pi-peer-${String(i).padStart(32, "0")}`;
+			transport.validAddresses.add(from);
+			await inbox.handleFrame(
+				{
+					msgV: 1,
+					msg_id: `sub-${i}`,
+					type: "control",
+					action: "notify_when_idle",
+					reply_to: from,
+					from,
+					nonce: `n-${i}`,
+				},
+				"peer",
+			);
+		}
+
+		inbox.onIdle();
+
+		// Exactly 64 notices: sub-0 (the oldest) was evicted by sub-64.
+		expect(outbox.controlCalls.length).toBe(64);
+		const nonces = outbox.controlCalls.map((c) => (c.frame as PeerIdleNoticeFrame).nonce);
+		expect(nonces).not.toContain("n-0");
+		expect(nonces).toContain("n-1");
+		expect(nonces).toContain("n-64");
+	});
+
+	it("an expired idleSub (31 min old) never fires on idle", async () => {
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const transport = makeTransport();
+		transport.validAddresses.add(from);
+		const { inbox, outbox } = makeInbox({ transport });
+		await inbox.handleFrame(
+			{
+				msgV: 1,
+				msg_id: "sub-old",
+				type: "control",
+				action: "notify_when_idle",
+				reply_to: from,
+				from,
+				nonce: "n-old",
+			},
+			"peer",
+		);
+		expect(outbox.controlCalls).toEqual([]);
+
+		// 31 minutes later a NEW subscription arrives — evicting the stale one.
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + 31 * 60_000);
+		const fresh = `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+		transport.validAddresses.add(fresh);
+		await inbox.handleFrame(
+			{
+				msgV: 1,
+				msg_id: "sub-fresh",
+				type: "control",
+				action: "notify_when_idle",
+				reply_to: fresh,
+				from: fresh,
+				nonce: "n-fresh",
+			},
+			"peer",
+		);
+		vi.useRealTimers();
+
+		inbox.onIdle();
+		// Only the fresh subscription fires; the 31-minute-old one was evicted.
+		const nonces = outbox.controlCalls.map((c) => (c.frame as PeerIdleNoticeFrame).nonce);
+		expect(nonces).toEqual(["n-fresh"]);
+	});
+
 });

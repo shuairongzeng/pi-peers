@@ -76,6 +76,7 @@ function makePacer(): ScriptedPacer {
 function makeGuard(): PeerGuard {
 	return {
 		check: (_fromKey, _frame, _ownHopToken, _queuedCount): PeerGuardCheck => ({ ok: true }),
+		checkChild: (): PeerGuardCheck => ({ ok: true }),
 		recordAccepted() {},
 		refund() {},
 	};
