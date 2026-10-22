@@ -172,6 +172,26 @@ describe("list self-healing", () => {
 		expect(existsSync(recordFile(DEAD_PID))).toBe(false);
 	});
 
+	it("keeps orphan key files whose pid is alive (starting-up instance)", () => {
+		freshRegistry();
+		// Startup order is key-then-record (the async project-root probe sits
+		// between them), so a starting instance's key briefly has no record.
+		// Sweeping it here would permanently break its inbound auth — the exact
+		// race that broke spawn_peer task delivery.
+		const keyFile = join(peersDir, `${LIVE_PID}.${"a".repeat(64)}.key`);
+		writeFileSync(keyFile, "key");
+		registry.list();
+		expect(existsSync(keyFile)).toBe(true);
+	});
+
+	it("deletes orphan key files whose pid is dead", () => {
+		freshRegistry();
+		const keyFile = join(peersDir, `${DEAD_PID}.${"b".repeat(64)}.key`);
+		writeFileSync(keyFile, "key");
+		registry.list();
+		expect(existsSync(keyFile)).toBe(false);
+	});
+
 	it("deletes records whose pid mismatches the file name (torn write)", () => {
 		freshRegistry();
 		writeFileSync(recordFile(12345), JSON.stringify(makeRecord(LIVE_PID)));

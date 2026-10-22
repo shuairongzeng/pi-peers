@@ -349,12 +349,23 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 			}
 			entries.push({ record, live: true });
 		}
-		// Orphan key files (pid without a live record) are useless credentials: self-heal.
+		// Orphan key files (pid without a live record) are swept ONLY when the
+		// pid is dead. A live pid with a key but no record is an instance still
+		// starting up (session_start publishes the key BEFORE the record — the
+		// async project-root probe sits between them); deleting its key would
+		// permanently break its inbound auth.
 		const livePids = new Set(entries.filter((e) => e.live).map((e) => e.record.pid));
 		for (const name of readDirNames(peersDir)) {
 			const keyMatch = PEER_KEY_FILE_RE.exec(name);
 			if (keyMatch && !livePids.has(Number(keyMatch[1]))) {
-				silentUnlink(join(peersDir, name));
+				const keyPid = Number(keyMatch[1]);
+				let alive = true;
+				try {
+					process.kill(keyPid, 0);
+				} catch (err) {
+					alive = (err as NodeJS.ErrnoException).code === "EPERM";
+				}
+				if (!alive) silentUnlink(join(peersDir, name));
 			}
 		}
 		entries.sort((a, b) => a.record.pid - b.record.pid);
