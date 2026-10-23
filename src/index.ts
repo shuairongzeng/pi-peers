@@ -61,6 +61,7 @@ import {
 	type PeerRecord,
 	type PeerRegistryEntry,
 	type PeerServer,
+	type PeerSocketAddress,
 	type PeerTokens,
 } from "./types.ts";
 
@@ -167,11 +168,20 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	const pacer = createPeerSenderPacer();
 
 	const tokens: PeerTokens = auth.generateTokens();
-	const socketAddress = transport.deriveSocketAddress(peersDir);
+	// Deriving the socket path touches the FS on POSIX (mkdir of the socks dir)
+	// — a broken registry dir must not crash extension load. Degrade instead:
+	// no listener and no record (a record without a reachable socket is junk),
+	// send-only remains usable.
+	let socketAddress: PeerSocketAddress | undefined;
+	try {
+		socketAddress = transport.deriveSocketAddress(peersDir);
+	} catch (err) {
+		console.warn(`[pi-peers] socket setup failed — this session can send but not receive: ${err instanceof Error ? err.message : String(err)}`);
+	}
 	const identity: PeerIdentity = {
 		pid: process.pid,
 		sessionId: "",
-		socketAddress: socketAddress.address,
+		socketAddress: socketAddress?.address ?? "",
 		name: "",
 		hopToken: randomBytes(4).toString("hex"),
 		tokens,
@@ -183,6 +193,13 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	let ctx: PeersExtensionContext | undefined;
 	let server: PeerServer | undefined;
 	let record: PeerRecord | undefined;
+	// Shutdown gate: set at session_shutdown BEFORE cleanup so the accept loop
+	// stops admitting messages into a dying session (a "delivered" receipt for a
+	// message nobody will read is worse than a connection refused).
+	let closing = false;
+	// Tracks the in-flight server.close() so a rapid session_start after
+	// shutdown waits for the old listener instead of racing it (EADDRINUSE).
+	let closingPromise: Promise<void> | undefined;
 	// Project root for scoping: git work-tree root, resolved once per
 	// session_start (computeProjectRoot is async; publishRecord() is a sync
 	// call site).
@@ -253,6 +270,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		firstLine: string | undefined,
 		lines: AsyncIterable<string>,
 	): Promise<void> => {
+		if (closing) {
+			conn.destroy();
+			return;
+		}
 		const token = firstLine !== undefined ? protocol.parseAuthLine(firstLine) : undefined;
 		const senderClass =
 			token === tokens.childToken
@@ -283,7 +304,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	};
 
 	const publishRecord = (): void => {
-		if (ctx === undefined) return;
+		if (ctx === undefined || socketAddress === undefined) return;
 		// Spawner-assigned name (PI_PEERS_NAME) wins over a user/derived name:
 		// it is the rendezvous key the spawning session waits for.
 		const envNameRaw = process.env[ENV_PEERS_NAME]?.trim();
@@ -294,6 +315,12 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		identity.sessionId = ctx.sessionManager.getSessionId();
 		const derivedName = `${basename(ctx.cwd) || "pi"}-${process.pid}`;
 		identity.name = registry.normalizeName(envName ?? sessionName ?? derivedName);
+		let usage: { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
+		try {
+			usage = ctx.getContextUsage?.();
+		} catch {
+			// a broken host usage hook must not break registration
+		}
 		record = {
 			version: 1,
 			pid: process.pid,
@@ -309,7 +336,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			startedAt: Date.now(),
 			procStart: registry.readProcStart(process.pid),
 			pidDomain: registry.pidDomain(),
-			contextUsage: ctx.getContextUsage?.(),
+			contextUsage: usage,
 			socketPath: socketAddress.path,
 			peerProtocol: PEER_PROTOCOL_VERSION,
 			features: [...PEER_FEATURES],
@@ -322,13 +349,33 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	const setStatus = (status: "busy" | "idle"): void => {
 		lastKnownStatus = status;
 		if (record === undefined) return;
-		const usage = ctx?.getContextUsage?.();
+		// Host/FS hiccups must not break the event chain: a throw here used to
+		// skip inbox.onIdle(), wedging queuedCount and idle subscriptions.
+		let usage: { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
+		try {
+			usage = ctx?.getContextUsage?.();
+		} catch {
+			// stale usage is fine
+		}
 		record = { ...record, status, statusUpdatedAt: Date.now(), ...(usage !== undefined ? { contextUsage: usage } : {}) };
-		registry.update(process.pid, {
-			status,
-			statusUpdatedAt: record.statusUpdatedAt,
-			...(usage !== undefined ? { contextUsage: usage } : {}),
-		});
+		try {
+			registry.update(process.pid, {
+				status,
+				statusUpdatedAt: record.statusUpdatedAt,
+				...(usage !== undefined ? { contextUsage: usage } : {}),
+			});
+		} catch {
+			// disk errors: in-memory record stays authoritative
+		}
+	};
+
+	// A degrade path must never die on its own warning toast.
+	const warn = (warnCtx: PeersExtensionContext, message: string): void => {
+		try {
+			warnCtx.ui.notify(message, "warning");
+		} catch {
+			console.warn(`[pi-peers] ${message}`);
+		}
 	};
 
 	const spawner = createPeerSpawner({ registry, outbox, cwd: () => ctx?.cwd ?? process.cwd() });
@@ -387,7 +434,11 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	pi.on("session_start", async (_event, eventCtx) => {
 		ctx = eventCtx;
-		if (server === undefined) {
+		closing = false;
+		// A previous session's listener may still be closing (close() is async) —
+		// wait it out before binding the same address.
+		if (closingPromise !== undefined) await closingPromise;
+		if (server === undefined && socketAddress !== undefined) {
 			try {
 				server = await transport.listen(socketAddress, (conn, firstLine, lines) => {
 					void acceptConnection(conn, firstLine, lines);
@@ -409,10 +460,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 				// to send-only instead of failing the whole session start. The record
 				// still publishes so other sessions see us; senders get a connect
 				// error which surfaces as the normal "offline" outcome.
-				eventCtx.ui.notify(
-					`peers: failed to start the listener — this session can send but not receive (${err instanceof Error ? err.message : String(err)})`,
-					"warning",
-				);
+				warn(eventCtx, `peers: failed to start the listener — this session can send but not receive (${err instanceof Error ? err.message : String(err)})`);
 			}
 		}
 		// Project scoping: resolve the git work-tree root here (async) so the
@@ -424,7 +472,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		} catch (err) {
 			// Broken registry dir (e.g. PI_PEERS_DIR points at a file): the session
 			// stays fully usable locally, just invisible to peers.
-			eventCtx.ui.notify(`peers: failed to publish the session record (${err instanceof Error ? err.message : String(err)})`, "warning");
+			warn(eventCtx, `peers: failed to publish the session record (${err instanceof Error ? err.message : String(err)})`);
 		}
 	});
 
@@ -445,10 +493,16 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	const onIdleEvent = (_event: unknown, eventCtx: PeersExtensionContext): void => {
 		if (isOmpContinuation(_event)) return;
 		ctx = eventCtx;
-		setStatus("idle");
+		// Flush idle subscriptions FIRST: they are the peer-visible contract; a
+		// throwing status publish must not skip them.
 		inbox.onIdle();
+		setStatus("idle");
 		if (ephemeral && didWork) {
-			host.notify("peers", "Ephemeral peer finished its work — shutting down.");
+			try {
+				host.notify("peers", "Ephemeral peer finished its work — shutting down.");
+			} catch {
+				// the quit below must run regardless
+			}
 			host.quit();
 		}
 	};
@@ -470,8 +524,14 @@ export default function peersExtension(pi: PeersHostAPI): void {
 			// unbounded array would bloat the file under scripted renames.
 			if (formerNames.length > 32) formerNames.splice(0, formerNames.length - 32);
 			identity.name = next;
-			registry.update(process.pid, { name: next, nameSource: "user", formerNames: [...formerNames] });
+			// Local record first — it is authoritative for envelope stamping; the
+			// disk update is best-effort (catches up on the next publish).
 			record = { ...record, name: next, nameSource: "user", formerNames: [...formerNames] };
+			try {
+				registry.update(process.pid, { name: next, nameSource: "user", formerNames: [...formerNames] });
+			} catch {
+				// disk errors must not undo the rename
+			}
 		}
 	});
 
@@ -490,10 +550,21 @@ export default function peersExtension(pi: PeersHostAPI): void {
 
 	pi.on("session_shutdown", async (event: unknown) => {
 		if (typeof event === "object" && event !== null && "reason" in event && event.reason !== "quit") return; // new/resume/fork republish via the following session_start
+		// Stop admitting inbound work before unpublishing: anything accepted after
+		// this point would be acknowledged yet never read.
+		closing = true;
 		cleanup();
 		const s = server;
 		server = undefined;
-		if (s !== undefined) await s.close();
+		if (s !== undefined) {
+			closingPromise = s
+				.close()
+				.catch(() => {})
+				.finally(() => {
+					closingPromise = undefined;
+				});
+			await closingPromise;
+		}
 	});
 
 	// Sync backstop for process exit (crash-safe cleanup of registry + key files).

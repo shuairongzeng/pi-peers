@@ -577,4 +577,38 @@ describe("peers plugin wiring (dual-host)", () => {
 			delete process.env.PI_PEERS_EPHEMERAL;
 		}
 	});
+
+	it("ephemeral quit still fires when notify throws and usage snapshot explodes", async () => {
+		process.env.PI_PEERS_EPHEMERAL = "1";
+		let quitCalls = 0;
+		try {
+			const { pi, handlers } = createFakePi();
+			peersExtension(pi);
+			const ctx = createFakeCtx(peersDir, {
+				hasUI: true,
+				getContextUsage: () => {
+					throw new Error("host usage API broken");
+				},
+				ui: {
+					notify: () => {
+						throw new Error("toast broken");
+					},
+					confirm: async () => true,
+				},
+				shutdown: () => {
+					quitCalls++;
+				},
+			});
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+			await handlers.get("agent_start")?.({ type: "agent_start" }, ctx);
+			// getContextUsage throws inside setStatus; notify throws in the
+			// ephemeral path — neither may prevent the quit.
+			await handlers.get("agent_settled")?.({ type: "agent_settled", aborted: false }, ctx);
+			expect(quitCalls).toBe(1);
+			// Record still reflects the status flip despite the broken usage hook.
+			expect(readOwnRecord().status).toBe("idle");
+		} finally {
+			delete process.env.PI_PEERS_EPHEMERAL;
+		}
+	});
 });
