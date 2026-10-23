@@ -1296,6 +1296,45 @@ describe("createPeerInbox", () => {
 		expect(host.injected.length).toBe(1);
 	});
 
+	it("onIdle flush where sendControl rejects completes clean with no unhandled rejection", async () => {
+		// The idle notice is fire-and-forget: sendControl rethrows
+		// PeerSendError, and a voided rejection would be an unhandled promise
+		// rejection (process crash under Node ≥15). Fail the send, flush, then
+		// drain a microtask tick: any unhandled rejection lands here and fails
+		// the test instead of crashing the runner.
+		const onUnhandled = vi.fn();
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const replyTo = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+			const transport = makeTransport();
+			transport.validAddresses.add(replyTo);
+			const outbox = makeScriptedOutbox();
+			outbox.failControl = true;
+			const { inbox } = makeInbox({ transport, outbox });
+			const frame: PeerControlFrame = {
+				msgV: 1,
+				msg_id: "sub-reject",
+				type: "control",
+				action: "notify_when_idle",
+				reply_to: replyTo,
+				from: replyTo,
+				fromName: "alpha",
+				nonce: "n-reject",
+			};
+			await inbox.handleFrame(frame, "peer");
+
+			inbox.onIdle();
+			await new Promise<void>((resolve) => setImmediate(resolve));
+
+			// The rejection was swallowed by the fire-and-forget catch; nothing
+			// escaped, and the flush itself recorded the (failed) attempt.
+			expect(onUnhandled).not.toHaveBeenCalled();
+			expect(outbox.controlCalls).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
 	// Shutdown receiving: every branch answers with a shutdown_response frame
 	// before any local effect (quit only after the response is sent).
 
@@ -1339,9 +1378,12 @@ describe("createPeerInbox", () => {
 		expect(host.confirmCalls).toEqual([]);
 	});
 
-	it("accept policy all: unknown sender (registry race) is accepted under all", async () => {
-		// No registry entries at all: benefit of the doubt.
-		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+	it("accept policy all: shutdown from an unregistered sender is denied (fail-closed)", async () => {
+		// Fail-closed: no registry entries at all, so the sender cannot be
+		// proven same-project. A spoofed/garbage `from` must not trigger a
+		// headless auto-quit under "all" — quit requires positive
+		// same-project evidence.
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all", hasUIValue: false } });
 		const frame: PeerControlFrame = {
 			msgV: 1,
 			msg_id: "shutdown-unknown",
@@ -1353,9 +1395,77 @@ describe("createPeerInbox", () => {
 
 		await inbox.handleFrame(frame, "peer");
 
+		expect(host.confirmCalls).toEqual([]);
+		expect(host.quitCalls).toBe(0);
+		expect(host.userNotifies).toEqual([]);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.action).toBe("shutdown_response");
+		expect(response.inReplyTo).toBe("shutdown-unknown");
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("cross-project refused");
+	});
+
+	it("accept policy all: unregistered shutdown sender headless → denied shutdown_response, no quit", async () => {
+		// Fail-closed regression guard: an unknown (unregistered) sender is
+		// cross-project, so a headless "all" session must refuse — the
+		// shutdown_response is denied and quit() is never called.
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all", hasUIValue: false, nextAnswer: "yes" },
+			// Own record registered, sender deliberately absent.
+			entries: [entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` })],
+		});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-unregistered",
+			type: "control",
+			action: "shutdown",
+			from,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.confirmCalls).toEqual([]);
+		expect(host.quitCalls).toBe(0);
+		expect(host.userNotifies).toEqual([]);
+		expect(outbox.controlCalls.length).toBe(1);
+		expect(outbox.controlCalls[0]!.address).toBe(from);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("cross-project refused");
+		expect(response.inReplyTo).toBe("shutdown-unregistered");
+	});
+
+	it("accept policy all: registered same-project shutdown sender is still accepted (regression guard)", async () => {
+		// Positive evidence both ways: sender and own records live in the
+		// registry and share a project root → the "all" auto-accept path still
+		// fires with no confirm dialog and a single quit.
+		const from = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all" },
+			entries: [
+				entry({ cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}` }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			],
+		});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-same-reg",
+			type: "control",
+			action: "shutdown",
+			from,
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		expect(host.confirmCalls).toEqual([]);
 		expect(host.quitCalls).toBe(1);
 		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
 		expect(response.outcome).toBe("accepted");
+		expect(response.reason).toBeUndefined();
+		expect(response.inReplyTo).toBe("shutdown-same-reg");
 	});
 
 	it("accept policy all: cross-project sender with UI → confirm shown; no → denied, no quit", async () => {
@@ -1418,10 +1528,10 @@ describe("createPeerInbox", () => {
 	it("accept policy all: malformed pipe: from-address finds no record (validated conversion)", async () => {
 		// The sender's wire address fails PEER_SOCKET_NAME_RE: recordForAddress
 		// converts it to undefined, so no registry record can match — the frame
-		// is treated as an unknown sender (accepted under "all"), never as a
-		// scoped same/cross-project verdict built from a bogus path.
+		// is treated as cross-project (fail-closed), never as a scoped
+		// same/cross-project verdict built from a bogus path.
 		const { inbox, host, outbox } = makeInbox({
-			host: { policy: "all", nextAnswer: "no" },
+			host: { policy: "all", hasUIValue: false, nextAnswer: "no" },
 			entries: [
 				entry({ cwd: "D:/work/beta", projectRoot: "D:/work/beta", socketPath: "\\\\.\\pipe\\LOCAL\\not-a-peer-name" }),
 				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
@@ -1438,11 +1548,13 @@ describe("createPeerInbox", () => {
 
 		await inbox.handleFrame(frame, "peer");
 
-		// Unknown sender under policy "all": accepted, no confirm, straight quit.
+		// Unknown sender under policy "all" is cross-project: headless refuses
+		// without a confirm and without quitting.
 		expect(host.confirmCalls).toEqual([]);
-		expect(host.quitCalls).toBe(1);
+		expect(host.quitCalls).toBe(0);
 		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
-		expect(response.outcome).toBe("accepted");
+		expect(response.outcome).toBe("denied");
+		expect(response.reason).toBe("cross-project refused");
 	});
 
 	it("accept policy off: shutdown is denied with a reason and no quit", async () => {
@@ -1566,7 +1678,10 @@ describe("createPeerInbox", () => {
 			identity: makeIdentity(),
 			protocol: proto,
 			transport: makeTransport(),
-			registry: makeRegistry(() => ({ kind: "none" })),
+			registry: makeRegistry(() => ({ kind: "none" }), [
+				entry({ cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}` }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			]),
 			guard: makeGuard(),
 			host,
 			outbox,

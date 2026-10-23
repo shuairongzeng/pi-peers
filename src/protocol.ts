@@ -69,8 +69,14 @@ const ATTR_SPECS: readonly { attr: string; field: keyof PeerContentAttrs }[] = [
 	{ attr: "from-name", field: "fromName" },
 ];
 
-/** Stripped from attribute values: `"` breaks out of the quoted value, `<>` could form tags, CR/LF would end the line. */
-const UNSAFE_ATTR_CHARS_RE = /["<>\r\n]/g;
+/**
+ * Stripped outright from attribute values: `"` breaks out of the quoted value, `<>` could form
+ * tags, CR/LF would end the line, and C0 controls (ESC/NUL/BEL/...), DEL, C1 controls, and the
+ * Unicode line/paragraph separators (U+2028/U+2029) would survive the byte-exact re-wrap on the
+ * receive path into agent-visible text (terminal ANSI injection). Strip-only — no replacement
+ * chars — so canonical re-wrap round-trip fidelity is preserved.
+ */
+const UNSAFE_ATTR_CHARS_RE = /["<>\r\n\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
 
 const WRAP_RE = new RegExp(
 	`^<${PEER_CONTENT_TAG}((?:\\s+[a-z-]+="[^"\\r\\n]*")*)\\s*>\\n([\\s\\S]*)\\n</${PEER_CONTENT_TAG}>$`,

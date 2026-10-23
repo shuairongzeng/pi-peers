@@ -314,6 +314,34 @@ describe("createPeerProtocol", () => {
 			);
 		});
 
+		it("strips ESC/NUL/BEL/DEL/C1/U+2028/U+2029 from attribute values (round-trip)", () => {
+			const attrs: PeerContentAttrs = {
+				from: "a\u001bb\u0000c\u0007d",
+				fromSession: "s\u001b[2J\u007f",
+				fromName: "n\u0085m\u2028\u2029o",
+			};
+			const text = protocol.wrapPeerContent(attrs, "body");
+			// Wrapping itself must emit no control character inside the attribute block.
+			const attrBlock = text.slice(0, text.indexOf(">\n"));
+			expect(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(attrBlock)).toBe(false);
+			const parsed = protocol.parsePeerContent(text);
+			expect(parsed).toEqual({
+				attrs: { from: "abcd", fromSession: "s[2J", fromName: "nmo" },
+				body: "body",
+			});
+		});
+
+		it("leaves clean attribute values untouched through a round-trip", () => {
+			const attrs: PeerContentAttrs = {
+				from: "pipe:LOCAL\\pi-peer-abc",
+				fromSession: "sess-42",
+				fromName: "alpha-1",
+			};
+			const text = protocol.wrapPeerContent(attrs, "hello");
+			const parsed = protocol.parsePeerContent(text);
+			expect(parsed).toEqual({ attrs, body: "hello" });
+		});
+
 		it("drops an attribute entirely when stripping empties it", () => {
 			const text = protocol.wrapPeerContent({ from: '""<>\r\n', fromSession: "ok" }, "b");
 			expect(text).toBe(`<${PEER_CONTENT_TAG} from-session="ok">\nb\n</${PEER_CONTENT_TAG}>`);

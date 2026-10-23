@@ -139,15 +139,16 @@ export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 
 	/**
 	 * Receiver-side project scope for policy "all" shutdowns: a cross-project
-	 * sender must not silently kill us. Same-project, unknown sender (registry
-	 * race: benefit of the doubt under "all"), or a missing own record are all
-	 * treated as same-project.
+	 * sender must not silently kill us. A quit decision requires positive
+	 * same-project evidence — an unknown sender (unregistered, dead, or a
+	 * spoofed/garbage `from`), or a missing own record, is treated as
+	 * cross-project so headless sessions refuse and UI sessions confirm.
 	 */
 	function isCrossProjectShutdown(frame: PeerShutdownFrame): boolean {
 		const sender = recordForAddress(frame.from);
-		if (sender === undefined) return false;
+		if (sender === undefined) return true;
 		const own = recordForAddress(identity.socketAddress);
-		if (own === undefined) return false;
+		if (own === undefined) return true;
 		return !sameProject(sender, own);
 	}
 
@@ -430,7 +431,10 @@ export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 			...(identity.name !== "" ? { fromName: identity.name } : {}),
 			...(sub.nonce !== undefined ? { nonce: sub.nonce } : {}),
 		};
-		void deps.outbox.sendControl(sub.replyTo, notice);
+		// Best-effort fire-and-forget, matching the sendReceipt convention: a
+		// rejection (sendControl rethrows PeerSendError) must never become an
+		// unhandled rejection — the notice is expendable, the process is not.
+		void deps.outbox.sendControl(sub.replyTo, notice).catch(() => {});
 	}
 
 	/** Fire pending subscriptions when the local agent transitions to idle. */

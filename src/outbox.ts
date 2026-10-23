@@ -297,11 +297,14 @@ export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 			};
 			lines.push(protocol.serializeFrame(notifyFrame));
 		}
-		lines.push(protocol.serializeFrame(frame));
 		try {
+			lines.push(protocol.serializeFrame(frame));
 			await deliver(address, record.socketPath, token, lines);
 		} catch (error) {
-			// Only send() consumed a pacer token, so only this path refunds it.
+			// Only send() consumed a pacer token, so only this path refunds it
+			// — including when frame serialization itself throws (e.g. the
+			// wire-cap message_too_large check): a send that never reached the
+			// wire must not leave the caller's bucket one token poorer.
 			pacer.refund(target);
 			throw error;
 		}
@@ -359,8 +362,11 @@ export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 		}
 		pruneReceipts();
 		receipts.set(frame.msg_id, { state: frame.state, at: Date.now() });
-		const sender = frame.fromName ?? frame.from;
-		const suffix = frame.reason !== undefined ? `: ${frame.reason}` : "";
+		// Peer-supplied sender/reason land in agent-visible notices and user
+		// toasts: sanitize before interpolation so control chars, ANSI escapes,
+		// and forged wrapper tags cannot be smuggled into agent context.
+		const sender = protocol.sanitizePeerText(frame.fromName ?? frame.from);
+		const suffix = frame.reason !== undefined ? `: ${protocol.sanitizePeerText(frame.reason)}` : "";
 		switch (frame.state) {
 			case "denied":
 			case "expired":
