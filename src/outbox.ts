@@ -1,10 +1,11 @@
 /**
  * outbox.ts — sending side of cross-session peer messaging.
  *
- * Resolves a peer name to a live registry record, looks up the peer's auth key,
+ * Resolves a peer name to a live registry record (the single
+ * resolve→live-check→address ladder in createResolveLiveTarget, also exported
+ * for the tool's shutdown action), looks up the peer's auth key once per send,
  * opens one short-lived connection, and writes the auth line followed by the
  * frame (plus an optional notify_when_idle subscription). Also tracks
- * asynchronous receipts reported by peers via peer_message_status frames.
  *
  * See types.ts for the module contract and docs/peers.md for the user-facing design.
  */
@@ -15,6 +16,7 @@ import {
 	PEER_RECEIPT_TTL_MS,
 	type PeerConnection,
 	type PeerControlFrame,
+	type PeerLiveTargetResolution,
 	type PeerMessageStatusFrame,
 	type PeerOutbox,
 	type PeerReceiptState,
@@ -37,10 +39,71 @@ interface ReceiptEntry {
 	at: number;
 }
 
-/** One candidate line in an "ambiguous" error: `name [ref] status cwd`. */
-function candidateLine(refOf: (record: PeerRecord) => string, entry: PeerRegistryEntry): string {
+/** One candidate line in an "ambiguous" error: `name [ref] status cwd`.
+ *  Exported so tool.ts renders shutdown ambiguity with the same format. */
+export function candidateLine(refOf: (record: PeerRecord) => string, entry: PeerRegistryEntry): string {
 	const { record } = entry;
 	return `${record.name} [${refOf(record)}] ${record.status} ${record.cwd}`;
+}
+
+/**
+ * The single resolve→live-check→address conversion ladder, shared by outbox
+ * sends and the tool's shutdown action (via the outbox dep it already has).
+ * Returns a discriminated union so callers render their own error text —
+ * PeerSendError throwing stays reserved for the send phase.
+ */
+export function createResolveLiveTarget(deps: PeerServiceDeps & { peersDir: string }): (target: string) => PeerLiveTargetResolution {
+	const { registry, transport } = deps;
+	return (target: string) => {
+		const resolution = registry.resolve(target);
+		if (resolution.kind === "none") {
+			// Scope decision: the outbox resolves against the full live registry
+			// and has no notion of the caller's project scope (that lives in
+			// tool.ts, which layers scoping on top via findCrossProjectTarget).
+			// Embedding the machine-wide peer list here would leak other
+			// projects' session names into this project's errors, so the error
+			// carries no list; tool.ts's describeSendError renders the scoped
+			// candidates (it knows the scope).
+			return {
+				ok: false,
+				error: new PeerSendError(
+					"not_found",
+					`no live peer matches "${target}": the peer may not be running or may have exited. ` +
+						`Socket addresses change on every start, so never reuse a stale address`,
+				),
+			};
+		}
+		if (resolution.kind === "ambiguous") {
+			return {
+				ok: false,
+				error: new PeerSendError(
+					"ambiguous",
+					`several live peers match "${target}"; resend with "name [ref]" to disambiguate`,
+					resolution.candidates.map((candidate) => candidateLine(registry.refOf, candidate)),
+				),
+			};
+		}
+		const { entry } = resolution;
+		const record = entry.record;
+		if (!entry.live) {
+			return {
+				ok: false,
+				error: new PeerSendError(
+					"offline",
+					`peer "${record.name}" (pid ${record.pid}) has a registry record but its process is dead; ` +
+						`it may have exited without cleaning up. Run the peers listing again after a moment`,
+				),
+			};
+		}
+		const address = transport.addressFromPath(record.socketPath);
+		if (address === undefined) {
+			return {
+				ok: false,
+				error: new PeerSendError("invalid_target", `unrecognized peer socket path: ${record.socketPath}`),
+			};
+		}
+		return { ok: true, entry, address };
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +112,7 @@ function candidateLine(refOf: (record: PeerRecord) => string, entry: PeerRegistr
 
 export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): PeerOutbox {
 	const { identity, protocol, transport, auth, registry, pacer, host } = deps;
+	const resolveLiveTarget = createResolveLiveTarget(deps);
 
 	/** msg_id -> latest receipt state and observation time; pruned lazily by TTL. */
 	const receipts = new Map<string, ReceiptEntry>();
@@ -116,20 +180,22 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		return idleNonces.delete(nonce);
 	}
 
+	// Canonical connect path of our own parent, when this process was spawned
+	// by a peer (identity.parent.socketAddress is the WIRE form). Sends and
+	// control deliveries to that path authenticate with the parent's child
+	// token (from identity) instead of a key file.
+	const parentPath = identity.parent ? transport.resolveAddress(identity.parent.socketAddress) : undefined;
 
 	/**
 	 * Open a connection, write the auth line plus each given serialized frame,
-	 * then end the outbound side. Never touches the pacer: only send() consumes
-	 * a token, so only send()'s catch path refunds one — a failed control
-	 * delivery (which consumed nothing) must not inflate the bucket.
+	 * then end the outbound side. `address` is the pre-resolved wire address
+	 * (the ladder already converted the record's connect path), and `token`
+	 * is the sender-resolved auth token — this function never looks either up.
+	 * Never touches the pacer: only send() consumes a token, so only send()'s
+	 * catch path refunds one — a failed control delivery (which consumed
+	 * nothing) must not inflate the bucket.
 	 */
-	async function deliver(target: string, socketPath: string, token: string, lines: string[]): Promise<void> {
-		// Registry records store the connect path; transport.connect takes the
-		// wire address form.
-		const address = transport.addressFromPath(socketPath);
-		if (address === undefined) {
-			throw new PeerSendError("invalid_target", `unrecognized peer socket path: ${socketPath}`);
-		}
+	async function deliver(address: string, socketPath: string, token: string, lines: string[]): Promise<void> {
 		let conn: PeerConnection | undefined;
 		try {
 			conn = await transport.connect(address);
@@ -156,41 +222,23 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			);
 		}
 
-		const resolution = registry.resolve(target);
-		if (resolution.kind === "none") {
-			// Scope decision: the outbox resolves against the full live registry
-			// and has no notion of the caller's project scope (that lives in
-			// tool.ts, which layers scoping on top via findCrossProjectTarget).
-			// Embedding the machine-wide peer list here would leak other
-			// projects' session names into this project's errors, so the error
-			// carries no list; tool.ts's describeSendError renders the scoped
-			// candidates (it knows the scope).
-			throw new PeerSendError(
-				"not_found",
-				`no live peer matches "${target}": the peer may not be running or may have exited. ` +
-					`Socket addresses change on every start, so never reuse a stale address`,
-			);
+		const resolved = resolveLiveTarget(target);
+		if (!resolved.ok) {
+			throw resolved.error;
 		}
-		if (resolution.kind === "ambiguous") {
-			throw new PeerSendError(
-				"ambiguous",
-				`several live peers match "${target}"; resend with "name [ref]" to disambiguate`,
-				resolution.candidates.map((candidate) => candidateLine(registry.refOf, candidate)),
-			);
-		}
-
-		const entry = resolution.entry;
+		const { entry, address } = resolved;
 		const record = entry.record;
-		if (!entry.live) {
-			throw new PeerSendError(
-				"offline",
-				`peer "${record.name}" (pid ${record.pid}) has a registry record but its process is dead; ` +
-					`it may have exited without cleaning up. Run the peers listing again after a moment`,
-			);
-		}
 
-		const key = auth.lookupKey(deps.peersDir, record.socketPath, record.pid);
-		if (key === undefined) {
+		// Token computed ONCE per send: the parent's child token when the target
+		// is our own parent (so it classifies us as "child" — no key file read),
+		// otherwise the peerToken from the target's published key file. This is
+		// the only key lookup this send performs; deliver() gets the resolved
+		// token and never re-reads it.
+		const token =
+			parentPath !== undefined && record.socketPath === parentPath && identity.parent !== undefined
+				? identity.parent.token
+				: auth.lookupKey(deps.peersDir, record.socketPath, record.pid)?.peerToken;
+		if (token === undefined) {
 			throw new PeerSendError(
 				"no_key",
 				`no auth key for peer "${record.name}" at ${record.socketPath}: the peer has not published a key ` +
@@ -241,7 +289,7 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		}
 		lines.push(protocol.serializeFrame(frame));
 		try {
-			await deliver(target, record.socketPath, tokenForPath(record.socketPath) ?? key.peerToken, lines);
+			await deliver(address, record.socketPath, token, lines);
 		} catch (error) {
 			// Only send() consumed a pacer token, so only this path refunds it.
 			pacer.refund(target);
@@ -263,25 +311,19 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		};
 	}
 
-	const parentPath = identity.parent ? transport.resolveAddress(identity.parent.socketAddress) : undefined;
-
-	/** Token the peer at `socketPath` expects from us: the parent's child token when
-	 *  talking to our own parent (so it classifies us as "child"), otherwise the
-	 *  peerToken from that socket's published key file. */
-	function tokenForPath(socketPath: string): string | undefined {
-		if (parentPath !== undefined && socketPath === parentPath) {
-			return identity.parent?.token;
-		}
-		return auth.lookupKey(deps.peersDir, socketPath)?.peerToken;
-	}
-
 	async function sendControl(address: string, frame: PeerControlFrame): Promise<void> {
 		const socketPath = transport.resolveAddress(address);
 		if (socketPath === undefined) {
 			throw new PeerSendError("invalid_target", `invalid peer socket address: ${address}`);
 		}
 		try {
-			const token = tokenForPath(socketPath);
+			// Parent-addressed control frames (shutdown of our own child, idle
+			// notices to the parent) take the child token from identity — no key
+			// file read; every other address looks up the peer's published key.
+			const token =
+				parentPath !== undefined && socketPath === parentPath && identity.parent !== undefined
+					? identity.parent.token
+					: auth.lookupKey(deps.peersDir, socketPath)?.peerToken;
 			if (token === undefined) {
 				// Best-effort: the peer's key file is gone (it exited); the receipt
 				// simply never arrives. Never treat silence as agreement anyway.
@@ -343,5 +385,6 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		expectsReceipt,
 		registerIdleNonce,
 		consumeIdleNonce,
+		resolveLiveTarget,
 	};
 }

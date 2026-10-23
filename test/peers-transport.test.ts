@@ -13,6 +13,7 @@ import {
 	type PeerConnectOptions,
 	type PeerListenOptions,
 	resolveAddress,
+	socketPathFromAddress,
 } from "../src/transport.ts";
 import {
 	PEER_KEY_FILE_RE,
@@ -161,6 +162,35 @@ describe("address validation and resolution", () => {
 			expect(addressFromPath("/tmp/no-suffix")).toBeUndefined();
 			expect(addressFromPath("")).toBeUndefined();
 		}
+	});
+
+	it("socketPathFromAddress converts wire addresses with no platform gate", () => {
+		const name = pipeName();
+		// pipe: both spellings, on any platform.
+		expect(socketPathFromAddress(`pipe:${name}`)).toBe(`\\\\.\\pipe\\${name}`);
+		expect(socketPathFromAddress(`pipe:LOCAL\\${name}`)).toBe(`\\\\.\\pipe\\LOCAL\\${name}`);
+		// sock: on any platform, validated like a connectable address.
+		const sock = `/tmp/pi-peer-test-${hex32()}.sock`;
+		expect(socketPathFromAddress(`sock:${sock}`)).toBe(sock);
+
+		// Invalid pipe name: PEER_SOCKET_NAME_RE governs.
+		expect(socketPathFromAddress("pipe:LOCAL\\pi-peer-short")).toBeUndefined();
+		expect(socketPathFromAddress(`pipe:pi-peer-${"g".repeat(32)}`)).toBeUndefined();
+		expect(socketPathFromAddress(`pipe:REMOTE\\${name}`)).toBeUndefined();
+		expect(socketPathFromAddress(`pipe:${name}\\..\\..\\evil`)).toBeUndefined();
+		expect(socketPathFromAddress("pipe:")).toBeUndefined();
+
+		// Invalid sock: path: validateSockPath governs.
+		expect(socketPathFromAddress("sock:relative/path.sock")).toBeUndefined();
+		expect(socketPathFromAddress("sock:/has/../traversal.sock")).toBeUndefined();
+		expect(socketPathFromAddress("sock:/no-suffix")).toBeUndefined();
+		expect(socketPathFromAddress("sock:")).toBeUndefined();
+
+		// Unknown prefixes and raw canonical paths are not wire addresses.
+		expect(socketPathFromAddress("tcp:host:1234")).toBeUndefined();
+		expect(socketPathFromAddress("")).toBeUndefined();
+		expect(socketPathFromAddress(`\\\\.\\pipe\\LOCAL\\${name}`)).toBeUndefined();
+		expect(socketPathFromAddress(`/tmp/pi-peer-test-${hex32()}.sock`)).toBeUndefined();
 	});
 });
 

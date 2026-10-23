@@ -46,10 +46,8 @@ import {
 	ENV_PEERS_TOKEN,
 	PEER_PROTOCOL_VERSION,
 	PEER_FEATURES,
-	normalizeFsPath,
-	projectRootOf,
 	resolvePeersDir,
-	sameProject,
+	sameProjectEntries,
 	type PeersExtensionContext,
 	type PeersHostAPI,
 	type PeerAcceptPolicy,
@@ -287,7 +285,11 @@ export default function peersExtension(pi: PeersHostAPI): void {
 				}
 				await inbox.handleFrame(frame, senderClass);
 			}
-		} catch {
+		} catch (err) {
+			// A throwing frame handler is a coding bug, not an attack: log it so it
+			// is visible, then drop the connection (never let one bad frame kill
+			// the listener).
+			console.error("[pi-peers] inbound frame handling failed:", err);
 			conn.destroy();
 		}
 	};
@@ -358,13 +360,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	const commandHandler = Object.assign(
 		async (args: string, commandCtx: PeersExtensionContext) => {
 			const live = registry.list().filter((entry) => entry.live);
-			const own = live.find((entry) => entry.record.pid === identity.pid)?.record;
-			const inProject = (entry: PeerRegistryEntry): boolean => {
-				if (own !== undefined) return sameProject(own, entry.record);
-				// Self not published (yet): ctx.cwd stands in for our project root.
-				const windows = registry.pidDomain().startsWith("win32:") || entry.record.pidDomain.startsWith("win32:");
-				return normalizeFsPath(projectRootOf(entry.record), windows) === normalizeFsPath(commandCtx.cwd, windows);
-			};
+			const inProject = sameProjectEntries(live, identity.pid, commandCtx.cwd, registry.pidDomain());
 			const mine = live.filter(inProject);
 			const hidden = live.filter((entry) => !inProject(entry));
 			if (hidden.length === 0) {

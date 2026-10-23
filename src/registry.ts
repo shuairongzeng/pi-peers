@@ -15,6 +15,8 @@ import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { PeerRecord, PeerRegistry, PeerRegistryEntry, PeerResolution } from "./types.ts";
 import { PEER_KEY_FILE_RE, PEER_RECORD_FILE_RE } from "./types.ts";
+import { keyFileNameFor } from "./auth.ts";
+import { socketPathFromAddress } from "./transport.ts";
 
 // ---------------------------------------------------------------------------
 // Boundary parsing: registry files are written by other processes, possibly
@@ -298,10 +300,9 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		return join(peersDir, `${pid}.json`);
 	}
 
-	/** Expected auth-key file path for a record (same naming auth.publishKey uses). */
+	/** Expected auth-key file path for a record (naming owned by auth.keyFileNameFor). */
 	function keyPathFor(record: PeerRecord): string {
-		const hash = createHash("sha256").update(record.socketPath).digest("hex");
-		return join(peersDir, `${record.pid}.${hash}.key`);
+		return join(peersDir, keyFileNameFor(record.pid, record.socketPath));
 	}
 
 	function publish(record: PeerRecord): void {
@@ -514,11 +515,9 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 
 		// A wire address (`pipe:…` / `sock:…`) or raw socket path selects a peer
 		// directly — this is how replies copy the incoming message's `from`.
-		const asPath = input.startsWith("pipe:")
-			? `\\\\.\\pipe\\${input.slice(5)}`
-			: input.startsWith("sock:")
-				? input.slice(5)
-				: input;
+		// socketPathFromAddress owns the wire-form conversion (and rejects
+		// malformed addresses); raw canonical paths pass through unchanged.
+		const asPath = socketPathFromAddress(input) ?? input;
 		const bySocketPath = toResolution(candidates.filter((entry) => entry.record.socketPath === asPath));
 		if (bySocketPath) {
 			return bySocketPath;

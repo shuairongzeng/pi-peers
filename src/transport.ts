@@ -109,25 +109,38 @@ export function isValidAddress(address: string): boolean {
 	return false;
 }
 
-/** Resolve a wire address back to the path net.connect()/listen() expects. */
-export function resolveAddress(address: string): string | undefined {
+/**
+ * Pure wire-address → canonical connect-path conversion, shared by every
+ * consumer of the `pipe:` / `sock:` forms (transport, registry, inbox).
+ * Unlike isValidAddress/resolveAddress this performs no platform gating:
+ * `pipe:LOCAL\X` → `\\.\pipe\LOCAL\X`, `sock:<path>` → `<path>`, with the
+ * pipe name and sock path validated exactly as a connectable address would
+ * be (PEER_SOCKET_NAME_RE / validateSockPath). Anything malformed, or any
+ * other shape (including a raw canonical path), yields undefined.
+ */
+export function socketPathFromAddress(address: string): string | undefined {
 	if (address.startsWith(PIPE_ADDRESS_PREFIX)) {
 		const name = address.slice(PIPE_ADDRESS_PREFIX.length);
-		if (!PEER_SOCKET_NAME_RE.test(name)) {
-			return undefined;
-		}
-		// Literal passthrough: \\.\pipe\<name> on the path side, both
-		// with and without the LOCAL\ namespace spelling.
-		return `\\\\.\\pipe\\${name}`;
+		return PEER_SOCKET_NAME_RE.test(name) ? `\\\\.\\pipe\\${name}` : undefined;
 	}
 	if (address.startsWith(SOCK_ADDRESS_PREFIX)) {
 		const path = address.slice(SOCK_ADDRESS_PREFIX.length);
-		if (isWin32() || !validateSockPath(path)) {
-			return undefined;
-		}
-		return path;
+		return validateSockPath(path) ? path : undefined;
 	}
 	return undefined;
+}
+
+/** Resolve a wire address back to the path net.connect()/listen() expects. */
+export function resolveAddress(address: string): string | undefined {
+	// Platform gates first (pipe: only on Windows, sock: only on POSIX);
+	// the conversion itself is shared with every wire-address consumer.
+	if (address.startsWith(PIPE_ADDRESS_PREFIX) && !isWin32()) {
+		return undefined;
+	}
+	if (address.startsWith(SOCK_ADDRESS_PREFIX) && isWin32()) {
+		return undefined;
+	}
+	return socketPathFromAddress(address);
 }
 
 /** Convert a canonical connect path (PeerRecord.socketPath) to its wire address form. */

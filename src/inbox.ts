@@ -27,6 +27,7 @@ import {
 	type PeerUserFrame,
 	sameProject,
 } from "./types.ts";
+import { socketPathFromAddress } from "./transport.ts";
 
 // ---------------------------------------------------------------------------
 // Idle subscriptions
@@ -123,27 +124,15 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	}
 
 	/**
-	 * Convert a wire address (`pipe:LOCAL\X` / `sock:<path>`) to the canonical
-	 * connect-path form stored in PeerRecord.socketPath, so registry entries can
-	 * be matched against frame senders and our own identity.
-	 */
-	function addressToSocketPath(address: string): string | undefined {
-		if (address.startsWith("pipe:")) {
-			return `\\\\.\\pipe\\${address.slice("pipe:".length)}`;
-		}
-		if (address.startsWith("sock:")) {
-			return address.slice("sock:".length);
-		}
-		return undefined;
-	}
-
-	/**
 	 * Peer-record lookup by wire address: entries whose record.socketPath
-	 * converts back to the given address. Live-only — a dead sender's record is
-	 * not a trustworthy project scope.
+	 * equals the canonical connect path the address converts to. Live-only —
+	 * a dead sender's record is not a trustworthy project scope. Addresses
+	 * are validated by the shared conversion: a malformed `pipe:`/`sock:`
+	 * value converts to undefined and finds nothing (previously the local
+	 * copy matched it verbatim and could mis-hit).
 	 */
 	function recordForAddress(address: string): PeerRecord | undefined {
-		const socketPath = addressToSocketPath(address);
+		const socketPath = socketPathFromAddress(address);
 		if (socketPath === undefined) return undefined;
 		const found = deps.registry.list().find((e) => e.live && e.record.socketPath === socketPath);
 		return found?.record;

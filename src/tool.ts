@@ -27,9 +27,14 @@ import type {
 	PeerSpawnOptions,
 	PeerToolDeps,
 } from "./types.ts";
-import { PEER_PROTOCOL_VERSION, PeerSendError, PeerSpawnError, normalizeFsPath, projectRootOf, sameProject } from "./types.ts";
-import type { PeerRegistryEntry, PeerSendErrorCode, PeersToolContext } from "./types.ts";
-import { addressFromPath } from "./transport.ts";
+import {
+	PEER_PROTOCOL_VERSION,
+	PeerSendError,
+	PeerSpawnError,
+	projectRootOf,
+	sameProjectEntries,
+} from "./types.ts";
+import type { PeerLiveTargetResolution, PeerOutbox, PeerSendErrorCode, PeersToolContext } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // Tool
@@ -142,7 +147,7 @@ function listLivePeers(
 	selfCwd: string,
 ): string {
 	const live = registry.list().filter((entry) => entry.live);
-	const sameProject = sameProjectEntries(registry, live, selfPid, selfCwd);
+	const sameProject = sameProjectEntries(live, selfPid, selfCwd, registry.pidDomain());
 	const entries = scope === "all" ? live : live.filter((entry) => sameProject(entry));
 	const hidden = live.length - entries.length;
 	if (entries.length === 0) {
@@ -156,31 +161,6 @@ function listLivePeers(
 }
 
 /**
- * Membership test for live entries sharing this session's project. The
- * reference is our own registry record when we have one (pid match); without
- * one (unregistered caller) the tool context's cwd stands in for our project
- * root, normalized on both sides so path-shape differences do not split
- * projects.
- */
-function sameProjectEntries(
-	registry: PeerRegistry,
-	live: PeerRegistryEntry[],
-	selfPid: number,
-	selfCwd: string,
-): (entry: PeerRegistryEntry) => boolean {
-	const selfEntry = live.find((entry) => entry.record.pid === selfPid);
-	if (selfEntry === undefined) {
-		// No record of our own: the local machine's pidDomain decides path
-		// case-folding for both sides of the comparison.
-		const windows = registry.pidDomain().startsWith("win32:");
-		const own = normalizeFsPath(selfCwd, windows);
-		return (entry) => normalizeFsPath(projectRootOf(entry.record), windows) === own;
-	}
-	const selfRecord = selfEntry.record;
-	return (entry) => sameProject(selfRecord, entry.record);
-}
-
-/**
  * When the default project scope would hide the send target: resolves `to`
  * within the same project first; if that yields nothing, resolves it against
  * the full live list. A unique hit there (but not in the project list) is a
@@ -190,7 +170,7 @@ function sameProjectEntries(
  */
 function findCrossProjectTarget(deps: PeerToolDeps, target: string, selfCwd: string): PeerSendError | undefined {
 	const live = deps.registry.list().filter((entry) => entry.live);
-	const sameProject = sameProjectEntries(deps.registry, live, deps.identity.pid, selfCwd);
+	const sameProject = sameProjectEntries(live, deps.identity.pid, selfCwd, deps.registry.pidDomain());
 	const inProject = deps.registry.resolveIn(target, live.filter((entry) => sameProject(entry)));
 	if (inProject.kind !== "none") {
 		return undefined;
@@ -213,38 +193,39 @@ function describeSendError(
 	scope: "project" | "all",
 	selfCwd: string,
 ): string {
+	// The outbox's error messages are already complete user-facing sentences
+	// (target, cause, remedy). Render them verbatim — never re-prefix with the
+	// category name, which produced double-wrapped text like
+	// 'No live peer matches "no live peer matches "alice"…"'.
 	switch (error.code) {
 		case "not_found":
 			// The listing uses the send's own scope: same-project peers only
 			// under the default, so an error in one project never leaks the
-			// names/refs of sessions in other projects.
-			return `No live peer matches "${error.message}". Run /peers to see live sessions.\nLive peers:\n${listLivePeers(registry, selfPid, scope, selfCwd)}`;
+			// names/refs of sessions in other projects. The outbox error says
+			// what happened; the appended listing adds information it does not
+			// carry (the scoped live peers).
+			return `${error.message}\nLive peers:\n${listLivePeers(registry, selfPid, scope, selfCwd)}`;
 		case "ambiguous": {
 			const candidates = error.candidates.length > 0 ? error.candidates : ["(no candidates)"];
-			return `Several live peers match. Resend with "name [ref]" to disambiguate:\n${candidates.join("\n")}`;
+			return `${error.message}\n${candidates.join("\n")}`;
 		}
 		case "offline":
-			return `Peer is offline (process dead or unreachable): ${error.message}. The peer may have exited; run /peers to refresh the list.`;
 		case "no_key":
-			return `No auth key for the peer (key file missing): ${error.message}. The peer may have restarted since it registered; retry, or ask its user to restart the session.`;
 		case "no_live_inbox":
-			return `No live inbox for the target (registry/key missing and endpoint unverifiable): ${error.message}. Run /peers to refresh the list.`;
 		case "connect_failed":
-			return `Could not connect to the peer's socket: ${error.message}. The peer may have just exited; run /peers and retry.`;
 		case "timeout":
-			return `Timed out sending to the peer: ${error.message}. The peer may be busy or gone; retry or check with /peers.`;
 		case "message_too_large":
-			return `Message exceeds the 1 MiB wire cap: ${error.message}. Write the content to a file and send the file path instead.`;
 		case "sender_paced":
-			return `Local pacing predicts the peer would drop this send (too many recent messages): ${error.message}. Wait a moment, merge messages, and retry.`;
+			// Already actionable end to end (cause + remedy in the message).
+			return error.message;
 		case "invalid_target":
 			// Cross-project refusals come from findCrossProjectTarget, whose
 			// message names the other project. types.ts is frozen (no structured
 			// hint field), so the marker is the message text itself.
 			if (error.message.includes("belongs to another project")) {
-				return `Invalid target: ${error.message}. Resend with scope: "all" (only if the user asked to reach that session).`;
+				return `${error.message} Resend with scope: "all" (only if the user asked to reach that session).`;
 			}
-			return `Invalid target: ${error.message}. Use a peer name from /peers, or "name [ref]" to disambiguate.`;
+			return error.message;
 	}
 }
 
@@ -288,52 +269,24 @@ async function attemptSend(
 /**
  * Resolve a shutdown target to its wire address with the same resolution and
  * project-scope rules as a send: "name", "name [ref]", or the raw address,
- * with cross-project targets refused under the default scope. Registry
- * records store the connect path; sendControl() takes the wire address
- * form, so the conversion goes through transport.addressFromPath — the
- * same helper the outbox itself uses for sends.
+ * with cross-project targets refused under the default scope. The ladder is
+ * the outbox's shared resolveLiveTarget (the outbox owns the injected
+ * transport, which does the connect-path→wire-address conversion); this
+ * function only layers the project-scope gate on top.
  */
 function resolveShutdownTarget(
 	deps: PeerToolDeps,
 	target: string,
 	scope: "project" | "all",
 	selfCwd: string,
-): { address: string; entry: PeerRegistryEntry } | PeerSendError {
+): PeerLiveTargetResolution {
 	if (scope === "project") {
 		const crossProject = findCrossProjectTarget(deps, target, selfCwd);
 		if (crossProject !== undefined) {
-			return crossProject;
+			return { ok: false, error: crossProject };
 		}
 	}
-	const resolution = deps.registry.resolve(target);
-	if (resolution.kind === "none") {
-		return new PeerSendError(
-			"invalid_target",
-			`no live peer matches "${target}": the peer may not be running or may have exited. ` +
-				'Call with action: "list" to see live peers first',
-		);
-	}
-	if (resolution.kind === "ambiguous") {
-		return new PeerSendError(
-			"ambiguous",
-			`several live peers match "${target}"; resend with "name [ref]" to disambiguate`,
-			resolution.candidates.map((candidate) =>
-				`${candidate.record.name} [${deps.registry.refOf(candidate.record)}] ${candidate.record.status} ${candidate.record.cwd}`,
-			),
-		);
-	}
-	const { entry } = resolution;
-	if (!entry.live) {
-		return new PeerSendError(
-			"offline",
-			`peer "${entry.record.name}" (pid ${entry.record.pid}) has a registry record but its process is dead`,
-		);
-	}
-	const address = addressFromPath(entry.record.socketPath);
-	if (address === undefined) {
-		return new PeerSendError("invalid_target", `unrecognized peer socket path: ${entry.record.socketPath}`);
-	}
-	return { address, entry };
+	return deps.outbox.resolveLiveTarget(target);
 }
 
 /**
@@ -359,9 +312,11 @@ async function runShutdownAction(
 		};
 	}
 	const resolved = resolveShutdownTarget(deps, target, scope, ctx.cwd);
-	if (resolved instanceof PeerSendError) {
+	if (!resolved.ok) {
 		return {
-			content: [{ type: "text", text: describeSendError(resolved, deps.registry, deps.identity.pid, scope, ctx.cwd) }],
+			content: [
+				{ type: "text", text: describeSendError(resolved.error, deps.registry, deps.identity.pid, scope, ctx.cwd) },
+			],
 			details: {},
 			isError: true,
 		};

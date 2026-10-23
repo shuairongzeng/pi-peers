@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPeerRegistry } from "../src/registry.ts";
 import { createPeerSpawner, hostCommand, type PeerExec, type SpawnedProcess } from "../src/spawn.ts";
-import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, type PeerRecord } from "../src/types.ts";
+import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, PeerSendError, type PeerRecord } from "../src/types.ts";
 
 let peersDir: string;
 
@@ -75,6 +75,7 @@ const fakeOutbox = (sent: Array<{ target: string; content: string }>) => ({
 		return { msgId: "m1", to: "addr", toName: target };
 	},
 	sendControl: async () => {},
+	resolveLiveTarget: () => ({ ok: false as const, error: new PeerSendError("not_found", "fake") }),
 	receiptOf: () => undefined,
 	handleReceipt: () => {},
 	registerOutbound: () => {},

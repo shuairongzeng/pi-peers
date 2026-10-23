@@ -265,6 +265,29 @@ export function sameProject(a: PeerRecord, b: PeerRecord): boolean {
 	return normalizeFsPath(projectRootOf(a), windows) === normalizeFsPath(projectRootOf(b), windows);
 }
 
+/**
+ * The single project-membership rule used by the tool's list/send scoping AND
+ * the /peers command. Own record wins when present; otherwise `selfCwd`
+ * stands in as our project root. Path case-folding follows either side's
+ * pidDomain (do not re-implement this rule at call sites — it has drifted
+ * before).
+ */
+export function sameProjectEntries(
+	live: PeerRegistryEntry[],
+	selfPid: number,
+	selfCwd: string,
+	ownPidDomain: string,
+): (entry: PeerRegistryEntry) => boolean {
+	const selfRecord = live.find((entry) => entry.record.pid === selfPid)?.record;
+	if (selfRecord !== undefined) {
+		return (entry) => sameProject(selfRecord, entry.record);
+	}
+	return (entry) => {
+		const windows = ownPidDomain.startsWith("win32:") || entry.record.pidDomain.startsWith("win32:");
+		return normalizeFsPath(projectRootOf(entry.record), windows) === normalizeFsPath(selfCwd, windows);
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Wire frames (newline-delimited JSON)
 // ---------------------------------------------------------------------------
@@ -406,7 +429,7 @@ export class PeerSendError extends Error {
 export interface PeerSendOutcome {
 	/** msg_id of the accepted frame. */
 	msgId: string;
-	/** Canonical socket address the frame was written to. */
+	/** Canonical connect path the frame was written to (PeerRecord.socketPath form). */
 	to: string;
 	/** Name of the peer at send time, when known. */
 	toName?: string;
@@ -611,9 +634,20 @@ export interface PeerSendOptions {
 	notifyWhenIdle?: boolean;
 }
 
+/** Result of the shared resolve→live-check→address ladder. */
+export type PeerLiveTargetResolution =
+	| { ok: true; entry: PeerRegistryEntry; address: string }
+	| { ok: false; error: PeerSendError };
+
 export interface PeerOutbox {
 	/** Resolve target name → live record → connect → auth → write frame. Throws PeerSendError. */
 	send(target: string, body: string, opts: PeerSendOptions): Promise<PeerSendOutcome>;
+	/**
+	 * The single resolve→live-check→wire-address ladder, shared by send() and
+	 * consumers that only need resolution (e.g. the tool's shutdown action).
+	 * Returns a discriminated union — no throwing in the lookup phase.
+	 */
+	resolveLiveTarget(target: string): PeerLiveTargetResolution;
 	/** Deliver a control frame to an explicit wire address (used for receipts and idle notices). */
 	sendControl(address: string, frame: PeerControlFrame): Promise<void>;
 	/** Latest receipt state observed for a msg_id we sent. */

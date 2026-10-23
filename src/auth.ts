@@ -23,9 +23,15 @@ interface PeerKeyFile {
 /** 32-hex token matcher (randomBytes(16) hex form). */
 const TOKEN_RE = /^[0-9a-f]{32}$/;
 
-/** sha256 of the canonical socket path, hex-encoded. */
-function hashSocketPath(canonicalSocketPath: string): string {
-	return createHash("sha256").update(canonicalSocketPath).digest("hex");
+/**
+ * Key-file name for one (pid, canonical socket path) pair:
+ * `<pid>.<sha256(socketPath)>.key`. This naming is the on-disk contract
+ * between auth (writes) and registry (orphan sweep, zombie detection), so
+ * it is exported once and both sides consume it.
+ */
+export function keyFileNameFor(pid: number, socketPath: string): string {
+	const hash = createHash("sha256").update(socketPath).digest("hex");
+	return `${pid}.${hash}.key`;
 }
 
 /** Generate a fresh token pair (32 hex chars each). */
@@ -52,9 +58,7 @@ export function publishKey(
 	procStart: string | undefined,
 	pidDomain: string,
 ): void {
-	mkdirSync(peersDir, { recursive: true, mode: 0o700 });
-	const hash = hashSocketPath(canonicalSocketPath);
-	const fileName = `${pid}.${hash}.key`;
+	const fileName = keyFileNameFor(pid, canonicalSocketPath);
 	const payload: PeerKeyFile = { pid, peerToken: tokens.peerToken };
 	if (procStart !== undefined) {
 		payload.procStart = procStart;
@@ -96,11 +100,10 @@ export function lookupKey(
 	canonicalSocketPath: string,
 	pidHint?: number,
 ): { pid: number; peerToken: string; procStart?: string; pidDomain?: string } | undefined {
-	const hash = hashSocketPath(canonicalSocketPath);
-
 	if (pidHint !== undefined) {
+		const fileName = keyFileNameFor(pidHint, canonicalSocketPath);
 		try {
-			const direct = parseKeyFile(readFileSync(join(peersDir, `${pidHint}.${hash}.key`), "utf8"), pidHint);
+			const direct = parseKeyFile(readFileSync(join(peersDir, fileName), "utf8"), pidHint);
 			if (direct !== undefined) {
 				return direct;
 			}
@@ -116,6 +119,7 @@ export function lookupKey(
 		return undefined;
 	}
 
+	const hash = createHash("sha256").update(canonicalSocketPath).digest("hex");
 	for (const entry of entries) {
 		const match = PEER_KEY_FILE_RE.exec(entry);
 		if (match === null || match[2] !== hash) {

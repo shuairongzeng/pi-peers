@@ -337,6 +337,7 @@ function makeScriptedOutbox(): ScriptedOutbox {
 		receiptsHandled: [],
 		failControl: false,
 		idleNonces: new Set<string>(),
+		resolveLiveTarget: () => ({ ok: false, error: new PeerSendError("not_found", "fake") }),
 		async send(_target, _body, _opts) {
 			return { msgId: "m-1", to: "x", toName: "n" };
 		},
@@ -1452,6 +1453,36 @@ describe("createPeerInbox", () => {
 		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
 		expect(response.outcome).toBe("denied");
 		expect(response.reason).toBe("cross-project refused");
+	});
+
+	it("accept policy all: malformed pipe: from-address finds no record (validated conversion)", async () => {
+		// The sender's wire address fails PEER_SOCKET_NAME_RE: recordForAddress
+		// converts it to undefined, so no registry record can match — the frame
+		// is treated as an unknown sender (accepted under "all"), never as a
+		// scoped same/cross-project verdict built from a bogus path.
+		const { inbox, host, outbox } = makeInbox({
+			host: { policy: "all", nextAnswer: "no" },
+			entries: [
+				entry({ cwd: "D:/work/beta", projectRoot: "D:/work/beta", socketPath: "\\\\.\\pipe\\LOCAL\\not-a-peer-name" }),
+				entry({ pid: 100, cwd: "D:/work/alpha", projectRoot: "D:/work/alpha", socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"f".repeat(32)}` }),
+			],
+		});
+		const frame: PeerControlFrame = {
+			msgV: 1,
+			msg_id: "shutdown-malformed",
+			type: "control",
+			action: "shutdown",
+			from: "pipe:LOCAL\\not-a-peer-name",
+			fromName: "alpha",
+		};
+
+		await inbox.handleFrame(frame, "peer");
+
+		// Unknown sender under policy "all": accepted, no confirm, straight quit.
+		expect(host.confirmCalls).toEqual([]);
+		expect(host.quitCalls).toBe(1);
+		const response = outbox.controlCalls[0]!.frame as PeerShutdownResponseFrame;
+		expect(response.outcome).toBe("accepted");
 	});
 
 	it("accept policy off: shutdown is denied with a reason and no quit", async () => {

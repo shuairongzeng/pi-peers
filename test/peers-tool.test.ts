@@ -10,10 +10,13 @@ import type {
 	PeerSpawnOptions,
 	PeerSpawnOutcome,
 	PeerToolDeps,
+	PeerTransport,
 	PeersCommandContext,
 	PeersToolDefinition,
 } from "../src/types.ts";
+import { createResolveLiveTarget } from "../src/outbox.ts";
 import { PeerSendError, PeerSpawnError } from "../src/types.ts";
+import type { PeerLiveTargetResolution } from "../src/types.ts";
 import { createPeerMessageTool, createPeerSpawnTool, createPeersCommand, peerLine } from "../src/tool.ts";
 
 // ---------------------------------------------------------------------------
@@ -44,13 +47,19 @@ function resolveInImpl(
 	name: string,
 	entries: Array<{ record: PeerRecord; live: boolean }>,
 ): { kind: "unique" | "ambiguous" | "none"; entry?: unknown; candidates?: unknown[] } {
+	// Wire address (pipe:…) selects by socket path, like the real registry.
+	const asPath = name.startsWith("pipe:") ? `\\\\.\\pipe\\${name.slice(5)}` : name;
+	const byPath = entries.filter(({ record }) => record.socketPath === asPath);
+	if (byPath.length > 0) {
+		return byPath.length > 1 ? { kind: "ambiguous", candidates: byPath } : { kind: "unique", entry: byPath[0] };
+	}
 	const matches = entries.filter(({ record }) => record.name === name);
 	if (matches.length === 0) return { kind: "none" };
 	if (matches.length > 1) return { kind: "ambiguous", candidates: matches };
 	return { kind: "unique", entry: matches[0] };
 }
 
-function makeRegistry(entries: PeerRecord[]): PeerRegistry {
+function makeRegistry(entries: PeerRecord[], pidDomain = "win32:box"): PeerRegistry {
 	const list = entries.map((rec) => ({ record: rec, live: true }));
 	return {
 		publish: () => {},
@@ -63,17 +72,19 @@ function makeRegistry(entries: PeerRecord[]): PeerRegistry {
 		refOf: (rec: PeerRecord) => `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`,
 		isAlive: () => true,
 		readProcStart: () => undefined,
-		pidDomain: () => "win32:box",
+		pidDomain: () => pidDomain,
 	} as unknown as PeerRegistry;
 }
 
-/** Outbox fake: wraps a plain send impl and logs sendControl calls. */
+/** Outbox fake: wraps a plain send impl and logs sendControl calls. The
+ *  optional resolver mimics what createPeerOutbox attaches at runtime. */
 function makeOutbox(
 	sendImpl: (
 		target: string,
 		body: string,
 		opts: { priority?: "next" | "now"; notifyWhenIdle?: boolean },
 	) => Promise<never | { msgId: string; to: string; toName?: string }>,
+	resolveLiveTarget?: (target: string) => PeerLiveTargetResolution,
 ): PeerOutbox & { controlCalls: Array<{ address: string; frame: PeerControlFrame }> } {
 	const controlCalls: Array<{ address: string; frame: PeerControlFrame }> = [];
 	return {
@@ -87,8 +98,34 @@ function makeOutbox(
 		expectsReceipt: () => false,
 		registerIdleNonce: () => {},
 		consumeIdleNonce: () => false,
+		...(resolveLiveTarget !== undefined ? { resolveLiveTarget } : {}),
 		controlCalls,
+	} as PeerOutbox & { controlCalls: Array<{ address: string; frame: PeerControlFrame }> };
+}
+
+/** Same ref format as makeRegistry's refOf (candidate lines use it). */
+function refOf(rec: PeerRecord): string {
+	return `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`;
+}
+/** Minimal fake transport whose addressFromPath logs every call (Windows pipe shape). */
+function makeLadderTransport(): Pick<PeerTransport, "addressFromPath"> & { addressFromPathCalls: string[] } {
+	const addressFromPathCalls: string[] = [];
+	return {
+		addressFromPath(path: string) {
+			addressFromPathCalls.push(path);
+			return path.startsWith("\\\\.\\pipe\\") ? `pipe:${path.slice("\\\\.\\pipe\\".length)}` : undefined;
+		},
+		addressFromPathCalls,
 	};
+}
+
+/** Build a resolveLiveTarget over the given registry + transport, like the real outbox does. */
+function makeResolver(
+	registry: PeerRegistry,
+	transport: Pick<PeerTransport, "addressFromPath">,
+): (target: string) => PeerLiveTargetResolution {
+	const stub = { registry, transport } as unknown as Parameters<typeof createResolveLiveTarget>[0];
+	return createResolveLiveTarget(stub);
 }
 
 /** Spawner fake: records every call and resolves a fixed outcome. */
@@ -115,10 +152,16 @@ function fakeIdentity(pid: number): PeerIdentity {
 }
 
 function fakeDeps(
-	opts: { outbox: PeerOutbox; entries?: PeerRecord[]; ownPid?: number; spawner?: PeerSpawner },
+	opts: {
+		outbox: PeerOutbox;
+		entries?: PeerRecord[];
+		ownPid?: number;
+		spawner?: PeerSpawner;
+		pidDomain?: string;
+	},
 ): PeerToolDeps {
 	const ownPid = opts.ownPid ?? 100;
-	const registry = makeRegistry(opts.entries ?? []);
+	const registry = makeRegistry(opts.entries ?? [], opts.pidDomain);
 	return {
 		outbox: opts.outbox,
 		registry,
@@ -401,7 +444,31 @@ describe("createPeerMessageTool project scoping", () => {
 		const result = await runTool(tool, { to: "ghost", message: "hi" }, "D:/work/alpha");
 		expect(sends).toBe(1);
 		expect(result.isError).toBe(true);
-		expect(textOf(result)).toContain("No live peer matches");
+		expect(textOf(result)).toContain("ghost");
+	});
+});
+
+describe("createPeerMessageTool shared project rule (either-side win32 folding)", () => {
+	it("case-folds a foreign-platform record's path when the local pidDomain is win32", async () => {
+		// No self record (own pid 999 is not registered): selfCwd stands in as
+		// our project root. The candidate is POSIX-domain with an UPPERCASE
+		// path; the local pidDomain is win32, so the either-side rule folds
+		// case and "D:/WORK/ALPHA" still matches D:/work/alpha.
+		const caseVariants = [
+			record({
+				pid: 210,
+				name: "gamma",
+				cwd: "D:/WORK/ALPHA/sub",
+				projectRoot: "D:/WORK/ALPHA",
+				sessionId: "2100000000000000",
+				pidDomain: "linux:host",
+			}),
+		];
+		const outbox = makeOutbox(async () => ({ msgId: "m-1", to: "x" }));
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: caseVariants, ownPid: 999 }));
+		const text = textOf(await runTool(tool, { action: "list" }, "D:/work/alpha"));
+		expect(text).toContain("gamma");
+		expect(text).not.toContain("(+1 in other projects)");
 	});
 });
 
@@ -597,9 +664,17 @@ describe("createPeerMessageTool error mapping", () => {
 		return textOf(result);
 	}
 
-	it("not_found lists only same-project live peers under the default scope", async () => {
-		const text = await errorText(new PeerSendError("not_found", "alpha"));
-		expect(text).toContain("No live peer matches");
+	it("not_found renders the outbox message once (no double wrap) and lists same-project peers only", async () => {
+		const text = await errorText(
+			new PeerSendError(
+				"not_found",
+				'no live peer matches "alpha": the peer may not be running or may have exited. Socket addresses change on every start, so never reuse a stale address',
+			),
+		);
+		// Single wrap: the message appears exactly once, not re-prefixed inside
+		// another 'No live peer matches "…"' envelope.
+		expect(text.match(/no live peer matches/g)).toHaveLength(1);
+		expect(text).toContain("Live peers:");
 		expect(text).toContain("alpha");
 		// beta lives in another project: a scoped error must not leak its name.
 		expect(text).not.toContain("beta");
@@ -616,31 +691,35 @@ describe("createPeerMessageTool error mapping", () => {
 		expect(text).toContain("beta");
 	});
 
-	it("ambiguous lists candidate lines", async () => {
-		const error = new PeerSendError("ambiguous", "alpha", [
-			"alpha [0aa1b2c]  busy  interactive  D:/work/alpha  (11111111)",
-			"alpha [0aa1b2c]  idle  rpc  D:/work/two  (33333333)",
+	it("ambiguous lists candidate lines after the outbox message", async () => {
+		const error = new PeerSendError("ambiguous", 'several live peers match "alpha"', [
+			"alpha [0aa1b2c] busy D:/work/alpha",
+			"alpha [0aa1b2c] idle D:/work/two",
 		]);
 		const text = await errorText(error);
-		expect(text).toContain("disambiguate");
-		expect(text).toContain("alpha [0aa1b2c]  busy");
-		expect(text).toContain("alpha [0aa1b2c]  idle");
+		expect(text).toContain('several live peers match "alpha"');
+		expect(text).toContain("alpha [0aa1b2c] busy");
+		expect(text).toContain("alpha [0aa1b2c] idle");
 	});
 
-	it("maps simple codes to actionable text", async () => {
+	it("maps simple codes to the outbox message verbatim (no re-prefixing)", async () => {
+		// The outbox messages are complete sentences: cause + remedy. The tool
+		// renders them as-is; the needles assert each code's message survives.
 		const cases: Array<[string, string]> = [
-			["offline", "offline"],
-			["no_key", "key"],
-			["timeout", "Timed out"],
-			["connect_failed", "connect"],
-			["sender_paced", "pacing"],
-			["message_too_large", "1 MiB"],
-			["invalid_target", "Invalid target"],
+			["offline", "process is dead"],
+			["no_key", "has not published a key"],
+			["timeout", "timed out"],
+			["connect_failed", "could not connect"],
+			["sender_paced", "pacing predicts"],
+			["message_too_large", "over the wire cap"],
+			["invalid_target", "unrecognized"],
 		];
 		for (const [code, needle] of cases) {
-			const text = await errorText(new PeerSendError(code as never, "the reason"));
+			const text = await errorText(new PeerSendError(code as never, `outbox says: ${needle}`));
 			expect(text.length, `code ${code} produced empty text`).toBeGreaterThan(0);
 			expect(text).toContain(needle);
+			// Exactly one layer: the rendered text IS the message.
+			expect(text).toBe(`outbox says: ${needle}`);
 		}
 	});
 
@@ -652,23 +731,30 @@ describe("createPeerMessageTool error mapping", () => {
 			),
 		);
 		expect(text).toContain('Resend with scope: "all" (only if the user asked to reach that session).');
-		expect(text).not.toContain("Use a peer name from /peers");
+		expect(text).toContain("belongs to another project");
 	});
 
-	it("invalid_target for other causes keeps the /peers guidance", async () => {
+	it("invalid_target for other causes renders the message verbatim", async () => {
 		const text = await errorText(new PeerSendError("invalid_target", "unrecognized peer socket path: bad"));
-		expect(text).toContain('Use a peer name from /peers, or "name [ref]" to disambiguate.');
-		expect(text).not.toContain("only if the user asked");
+		expect(text).toBe("unrecognized peer socket path: bad");
 	});
 
-	it("no_key text points at a peer restart, not a wrong path", async () => {
+	it("no_key renders the outbox message (which carries the retry guidance) verbatim", async () => {
 		const text = await errorText(
-			new PeerSendError("no_key", 'no auth key for peer "alpha" at path: has not published a key'),
+			new PeerSendError(
+				"no_key",
+				'no auth key for peer "alpha" at path: the peer has not published a key; wait for it to re-register, then retry',
+			),
 		);
-		expect(text).toContain(
-			"The peer may have restarted since it registered; retry, or ask its user to restart the session.",
-		);
+		expect(text).toContain("wait for it to re-register, then retry");
 		expect(text).not.toContain("~/.pi/agent/peers/");
+	});
+
+	it("offline renders the outbox message once (no 'run /peers' duplicate of its own guidance)", async () => {
+		const message =
+			'peer "gamma" (pid 400) has a registry record but its process is dead; it may have exited without cleaning up. Run the peers listing again after a moment';
+		const text = await errorText(new PeerSendError("offline", message));
+		expect(text).toBe(message);
 	});
 
 	it("rethrows non-PeerSendError exceptions", async () => {
@@ -767,6 +853,14 @@ describe("createPeerMessageTool action=shutdown", () => {
 		sessionId: "2000000000000000",
 		socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"b".repeat(32)}`,
 	});
+	const alpha2 = record({
+		pid: 250,
+		name: "alpha",
+		cwd: "D:/work/alpha/deep",
+		projectRoot: "D:/work/alpha",
+		sessionId: "2500000000000000",
+		socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"c".repeat(32)}`,
+	});
 	const beta = record({
 		pid: 300,
 		name: "beta",
@@ -775,15 +869,24 @@ describe("createPeerMessageTool action=shutdown", () => {
 		sessionId: "3000000000000000",
 	});
 
+	/** Outbox fake with the shared ladder installed, like createPeerOutbox does. */
+	function makeShutdownOutbox(entries: PeerRecord[]) {
+		const transport = makeLadderTransport();
+		const registry = makeRegistry(entries);
+		const resolver = makeResolver(registry, transport);
+		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }), resolver);
+		return { outbox, transport, registry };
+	}
+
 	it("sends one shutdown frame to the peer's wire address with from and reason", async () => {
-		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+		const { outbox } = makeShutdownOutbox([selfRecord, alpha]);
 		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
 		const result = await runTool(tool, { action: "shutdown", to: "alpha", reason: "work done" }, "D:/work/alpha");
 		expect(result.isError).toBeUndefined();
 		expect(outbox.controlCalls).toHaveLength(1);
 		const { address, frame } = outbox.controlCalls[0]!;
-		// Wire address form, derived from the record's connect path the same
-		// way the outbox does it.
+		// Wire address form, derived from the record's connect path by the
+		// shared ladder inside the outbox (not by tool.ts directly).
 		expect(address).toBe(`pipe:LOCAL\\pi-peer-${"b".repeat(32)}`);
 		expect(frame.type).toBe("control");
 		expect(frame.action).toBe("shutdown");
@@ -797,19 +900,55 @@ describe("createPeerMessageTool action=shutdown", () => {
 		expect(textOf(result)).toContain("accept policy");
 	});
 
-	it("shutdown to an unknown name is an invalid_target error", async () => {
-		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+	it("shutdown resolution goes through the outbox's transport.addressFromPath", async () => {
+		const { outbox, transport } = makeShutdownOutbox([selfRecord, alpha]);
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
+		await runTool(tool, { action: "shutdown", to: "alpha" }, "D:/work/alpha");
+		// The shared ladder (inside the outbox) performed the connect-path →
+		// wire-address conversion; tool.ts has no addressFromPath import left.
+		expect(transport.addressFromPathCalls).toEqual([alpha.socketPath]);
+	});
+
+	it("shutdown to a wire address resolves through the shared ladder", async () => {
+		const { outbox } = makeShutdownOutbox([selfRecord, alpha]);
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha], ownPid: 100 }));
+		const result = await runTool(
+			tool,
+			{ action: "shutdown", to: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}` },
+			"D:/work/alpha",
+		);
+		expect(result.isError).toBeUndefined();
+		expect(outbox.controlCalls).toHaveLength(1);
+		expect(outbox.controlCalls[0]!.address).toBe(`pipe:LOCAL\\pi-peer-${"b".repeat(32)}`);
+		expect(textOf(result)).toContain('Shutdown requested for "alpha"');
+	});
+
+	it("shutdown to an ambiguous name lists candidates in the shared format", async () => {
+		const { outbox } = makeShutdownOutbox([selfRecord, alpha, alpha2]);
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, alpha2], ownPid: 100 }));
+		const result = await runTool(tool, { action: "shutdown", to: "alpha" }, "D:/work/alpha");
+		expect(outbox.controlCalls).toHaveLength(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		expect(text).toContain('several live peers match "alpha"');
+		// candidateLine format (name [ref] status cwd), shared with the outbox.
+		expect(text).toContain(`alpha [${refOf(alpha)}] busy D:/work/alpha/sub`);
+		expect(text).toContain(`alpha [${refOf(alpha2)}] busy D:/work/alpha/deep`);
+	});
+
+	it("shutdown to an unknown name is a not_found error (single wrap)", async () => {
+		const { outbox } = makeShutdownOutbox([selfRecord]);
 		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord], ownPid: 100 }));
 		const result = await runTool(tool, { action: "shutdown", to: "ghost" }, "D:/work/alpha");
 		expect(outbox.controlCalls).toHaveLength(0);
 		expect(result.isError).toBe(true);
 		const text = textOf(result);
-		expect(text).toContain("Invalid target");
-		expect(text).toContain("ghost");
+		expect(text).toContain('no live peer matches "ghost"');
+		expect(text.match(/no live peer matches/g)).toHaveLength(1);
 	});
 
 	it("shutdown to a cross-project peer is refused under the default scope", async () => {
-		const outbox = makeOutbox(async () => ({ msgId: "m", to: "x" }));
+		const { outbox } = makeShutdownOutbox([selfRecord, beta]);
 		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, beta], ownPid: 100 }));
 		const result = await runTool(tool, { action: "shutdown", to: "beta" }, "D:/work/alpha");
 		expect(outbox.controlCalls).toHaveLength(0);

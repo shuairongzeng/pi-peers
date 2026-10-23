@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { createPeerRegistry, parseProcStatStarttime } from "../src/registry.ts";
 import type { PeerRecord, PeerRegistry } from "../src/types.ts";
+import { generateTokens, keyFileNameFor, publishKey } from "../src/auth.ts";
 
 const LIVE_PID = process.pid;
 const DEAD_PID = 999999;
@@ -25,10 +26,10 @@ function freshRegistry(): PeerRegistry {
 	return registry;
 }
 
-/** Key file name for a record (same naming auth/registry use). */
+/** Key file name for a record — now sourced from the auth export itself, so
+ * fixtures and the registry sweep can never drift apart. */
 function keyFileName(record: PeerRecord): string {
-	const hash = createHash("sha256").update(record.socketPath).digest("hex");
-	return `${record.pid}.${hash}.key`;
+	return keyFileNameFor(record.pid, record.socketPath);
 }
 
 /** list() sweeps live-pid records whose auth key is missing: fixtures plant one. */
@@ -191,6 +192,29 @@ describe("unpublish", () => {
 	it("does not throw when nothing is published", () => {
 		freshRegistry();
 		expect(() => registry.unpublish(DEAD_PID)).not.toThrow();
+	});
+});
+
+describe("key file naming parity (auth.publishKey ↔ registry sweep)", () => {
+	it("a key published by auth keeps its registry record live and unswept", () => {
+		const reg = freshRegistry();
+		const record = makeRecord(LIVE_PID, { name: "alice" });
+		// Replace the fixture's planted placeholder with a real auth key
+		// written by auth.publishKey under the shared naming.
+		rmSync(join(peersDir, keyFileName(record)), { force: true });
+		publishKey(peersDir, record.pid, record.socketPath, generateTokens(), undefined, "win32:testhost");
+
+		registry.publish(record);
+		// The key exists under exactly the name the registry's sweep expects.
+		expect(existsSync(join(peersDir, keyFileNameFor(record.pid, record.socketPath)))).toBe(true);
+		// list() runs the zombie check (live record needs its key) and the
+		// orphan-key sweep: a naming mismatch would kill either side.
+		const entries = reg.list();
+		expect(entries).toHaveLength(1);
+		expect(entries[0]).toMatchObject({ live: true, record: { name: "alice" } });
+		// Unswept: both the record and the auth-published key survive.
+		expect(existsSync(join(peersDir, `${record.pid}.json`))).toBe(true);
+		expect(existsSync(join(peersDir, keyFileNameFor(record.pid, record.socketPath)))).toBe(true);
 	});
 });
 
@@ -577,9 +601,10 @@ describe("resolve", () => {
 
 	it("resolves by wire address form (pipe:/sock: prefixes)", () => {
 		freshRegistry();
-		registry.publish(makeRecord(LIVE_PID, { name: "alice", socketPath: "\\\\.\\pipe\\LOCAL\\pi-peer-aaaa1111" }));
+		const pipe = `pi-peer-${"a".repeat(32)}`;
+		registry.publish(makeRecord(LIVE_PID, { name: "alice", socketPath: `\\\\.\\pipe\\LOCAL\\${pipe}` }));
 		registry.publish(makeRecord(secondLivePid, { name: "bob", socketPath: "/tmp/pi-peers/socks/1.sock" }));
-		expect(registry.resolve("pipe:LOCAL\\pi-peer-aaaa1111")).toMatchObject({
+		expect(registry.resolve(`pipe:LOCAL\\${pipe}`)).toMatchObject({
 			kind: "unique",
 			entry: { record: { name: "alice" } },
 		});
@@ -587,10 +612,12 @@ describe("resolve", () => {
 			kind: "unique",
 			entry: { record: { name: "bob" } },
 		});
+		// A malformed wire address no longer falls through to a verbatim
+		// string match — the shared conversion rejects it and finds nothing.
+		expect(registry.resolve("pipe:LOCAL\\pi-peer-aaaa1111").kind).toBe("none");
 	});
 
 	it("prefers an exact sessionId over a colliding peer name", () => {
-		freshRegistry();
 		registry.publish(makeRecord(LIVE_PID, { name: "alice", sessionId: "sess-alice" }));
 		registry.publish(makeRecord(secondLivePid, { name: "sess-alice", sessionId: "sess-other" }));
 		expect(registry.resolve("sess-alice")).toMatchObject({

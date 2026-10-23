@@ -82,11 +82,20 @@ function makeGuard(): PeerGuard {
 	};
 }
 
-function makeAuth(keys: Record<string, { pid: number; peerToken: string }> = {}): PeerAuth {
+interface ScriptedAuth extends PeerAuth {
+	/** Number of lookupKey calls (one per send in the restructured outbox). */
+	lookupCalls: string[];
+}
+
+function makeAuth(keys: Record<string, { pid: number; peerToken: string }> = {}): ScriptedAuth {
 	return {
+		lookupCalls: [],
 		generateTokens: () => ({ peerToken: "new-peer", childToken: "new-child" }),
 		publishKey: () => {},
-		lookupKey: (_peersDir: string, canonicalSocketPath: string) => keys[canonicalSocketPath],
+		lookupKey(peersDir: string, canonicalSocketPath: string) {
+			this.lookupCalls.push(canonicalSocketPath);
+			return keys[canonicalSocketPath];
+		},
 		deleteKeys: () => {},
 	};
 }
@@ -186,7 +195,7 @@ function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: Pe
 	};
 }
 
-function makeIdentity(): PeerIdentity {
+function makeIdentity(overrides: Partial<PeerIdentity> = {}): PeerIdentity {
 	return {
 		pid: 100,
 		sessionId: "self-session",
@@ -194,6 +203,7 @@ function makeIdentity(): PeerIdentity {
 		name: "me",
 		hopToken: "hop-self",
 		tokens: { peerToken: "t1", childToken: "t2" },
+		...overrides,
 	};
 }
 /** Minimal protocol fake: real serialization, stubbed parsing. */
@@ -227,13 +237,14 @@ function makeDeps(
 		transport?: FakeTransport;
 		pacer?: ScriptedPacer;
 		host?: ScriptedHost;
-		auth?: PeerAuth;
+		auth?: ScriptedAuth;
 		registry?: PeerRegistry;
+		identity?: PeerIdentity;
 	} = {},
 ) {
 	const alphaEntry = entry();
 	const deps = {
-		identity: makeIdentity(),
+		identity: overrides.identity ?? makeIdentity(),
 		protocol: proto,
 		transport: overrides.transport ?? makeTransport(),
 		auth: overrides.auth ?? makeAuth({ [alphaEntry.record.socketPath]: { pid: 4242, peerToken: "key-alpha" } }),
@@ -387,5 +398,58 @@ describe("createPeerOutbox idle nonces", () => {
 		// auth + user frame only — no subscription line on the wire.
 		expect(transport.sessions[0]!.lines).toHaveLength(2);
 		expect(outcome.notifyIdleUnsupported).toBe(true);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Single token computation per send
+// ---------------------------------------------------------------------------
+
+describe("createPeerOutbox token resolution", () => {
+	it("send performs exactly one key lookup for the target", async () => {
+		const alphaEntry = entry();
+		const auth = makeAuth({ [alphaEntry.record.socketPath]: { pid: 4242, peerToken: "key-alpha" } });
+		const deps = makeDeps({
+			auth,
+			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		await outbox.send("alpha", "hi", {});
+
+		// One send → one lookupKey call for the target socket path (the token
+		// is passed down to deliver(); nothing re-reads the key file).
+		expect(auth.lookupCalls).toEqual([alphaEntry.record.socketPath]);
+		// The wire carries that key's token.
+		const transport = deps.transport as FakeTransport;
+		const authLine = JSON.parse(transport.sessions[0]!.lines[0]!) as { token: string };
+		expect(authLine.token).toBe("key-alpha");
+	});
+
+	it("send to our own parent authenticates with the parent's child token and never reads a key", async () => {
+		// The parent's socket, in WIRE form; the outbox resolves it to the
+		// canonical path, which the target record also stores.
+		const parentWire = `pipe:LOCAL\\pi-peer-${"e".repeat(32)}`;
+		const parentEntry = entry({
+			pid: 77,
+			name: "parent-peer",
+			socketPath: `\\\\.\\pipe\\LOCAL\\pi-peer-${"e".repeat(32)}`,
+		});
+		const auth = makeAuth(); // empty key table: any lookup returns undefined
+		const deps = makeDeps({
+			auth,
+			identity: makeIdentity({ parent: { socketAddress: parentWire, token: "child-token-42" } }),
+			registry: makeRegistry(() => ({ kind: "unique", entry: parentEntry })),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		await outbox.send("parent-peer", "hi parent", {});
+
+		// The CHILD token (identity.parent.token) is on the auth line, and
+		// lookupKey was never called for the parent's socket path.
+		const transport = deps.transport as FakeTransport;
+		const authLine = JSON.parse(transport.sessions[0]!.lines[0]!) as { token: string };
+		expect(authLine.token).toBe("child-token-42");
+		expect(auth.lookupCalls).toEqual([]);
 	});
 });
