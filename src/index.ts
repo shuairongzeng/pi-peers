@@ -61,7 +61,6 @@ import {
 	type PeerRecord,
 	type PeerRegistryEntry,
 	type PeerServer,
-	type PeerServiceDeps,
 	type PeerTokens,
 } from "./types.ts";
 
@@ -244,21 +243,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		},
 	};
 
-	const deps: PeerServiceDeps = {
-		identity,
-		protocol,
-		transport,
-		auth,
-		registry,
-		guard,
-		pacer,
-		host,
-		// Wired below; outbox is constructed before inbox, then both share deps.
-		outbox: undefined as unknown as PeerOutbox,
-	};
-	const outbox = createPeerOutbox({ ...deps, peersDir });
-	deps.outbox = outbox;
-	const inbox: PeerInbox = createPeerInbox({ ...deps, outbox });
+	// Outbox is constructed first (it has no inbox/guard needs); the inbox then
+	// receives it as a normal dep. No placeholder mutation.
+	const outbox = createPeerOutbox({ identity, protocol, transport, auth, registry, pacer, host, peersDir });
+	const inbox: PeerInbox = createPeerInbox({ identity, protocol, transport, registry, guard, host, outbox });
 
 	const acceptConnection = async (
 		conn: PeerConnection,

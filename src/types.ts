@@ -707,16 +707,28 @@ export interface PeerHost {
 	quit(): void;
 }
 
-export interface PeerServiceDeps {
+/** Deps the outbox (and its shared resolve ladder) is constructed from. */
+export interface PeerOutboxDeps {
 	identity: PeerIdentity;
 	protocol: PeerProtocol;
 	transport: PeerTransport;
 	auth: PeerAuth;
 	registry: PeerRegistry;
-	guard: PeerGuard;
 	pacer: PeerSenderPacer;
 	host: PeerHost;
-	/** Set after construction (inbox needs it for receipts; outbox is built before inbox). */
+	/** Registry directory: auth keys are looked up next to the records. */
+	peersDir: string;
+}
+
+/** Deps the inbox is constructed from; the outbox is built first and handed in. */
+export interface PeerInboxDeps {
+	identity: PeerIdentity;
+	protocol: PeerProtocol;
+	transport: PeerTransport;
+	registry: PeerRegistry;
+	guard: PeerGuard;
+	host: PeerHost;
+	/** Receipts and idle notices are sent through the outbox (best-effort). */
 	outbox: PeerOutbox;
 }
 

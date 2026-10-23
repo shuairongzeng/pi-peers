@@ -18,10 +18,9 @@ import {
 	type PeerIdleNoticeFrame,
 	type PeerInbox,
 	type PeerMessageStatusFrame,
-	type PeerOutbox,
 	type PeerReceiptState,
 	type PeerRecord,
-	type PeerServiceDeps,
+	type PeerInboxDeps,
 	type PeerShutdownFrame,
 	type PeerShutdownResponseFrame,
 	type PeerUserFrame,
@@ -54,7 +53,7 @@ const PREVIEW_MAX_CHARS = 500;
 // Inbox
 // ---------------------------------------------------------------------------
 
-export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }): PeerInbox {
+export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 	const { identity, protocol, transport, guard, host } = deps;
 
 	/**

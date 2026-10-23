@@ -3,12 +3,9 @@ import { createPeerOutbox } from "../src/outbox.ts";
 import {
 	type PeerAuth,
 	type PeerConnection,
-	type PeerGuard,
-	type PeerGuardCheck,
 	type PeerHost,
 	type PeerIdentity,
 	type PeerMessageStatusFrame,
-	type PeerOutbox,
 	type PeerProtocol,
 	type PeerRegistry,
 	type PeerRegistryEntry,
@@ -19,7 +16,7 @@ import {
 } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
-// Fakes (in-memory doubles for the PeerServiceDeps surface)
+// Fakes (in-memory doubles for the PeerOutboxDeps surface)
 // ---------------------------------------------------------------------------
 
 interface ScriptedHost extends PeerHost {
@@ -70,15 +67,6 @@ function makePacer(): ScriptedPacer {
 		refund(target) {
 			this.refunded.push(target);
 		},
-	};
-}
-
-function makeGuard(): PeerGuard {
-	return {
-		check: (_fromKey, _frame, _ownHopToken, _queuedCount): PeerGuardCheck => ({ ok: true }),
-		checkChild: (): PeerGuardCheck => ({ ok: true }),
-		recordAccepted() {},
-		refund() {},
 	};
 }
 
@@ -249,11 +237,9 @@ function makeDeps(
 		transport: overrides.transport ?? makeTransport(),
 		auth: overrides.auth ?? makeAuth({ [alphaEntry.record.socketPath]: { pid: 4242, peerToken: "key-alpha" } }),
 		registry: overrides.registry ?? makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-		guard: makeGuard(),
 		pacer: overrides.pacer ?? makePacer(),
 		host: overrides.host ?? makeHost(),
 		peersDir: "/fake/peers",
-		outbox: undefined as unknown as PeerOutbox,
 	};
 	return deps;
 }

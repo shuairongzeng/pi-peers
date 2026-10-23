@@ -30,11 +30,13 @@ import {
 	type PeerHost,
 	type PeerIdentity,
 	type PeerInbox,
+	type PeerOutbox,
 	type PeerPriority,
 	type PeerRecord,
+	type PeerRegistry,
 	type PeerServer,
-	type PeerServiceDeps,
 	type PeerSocketAddress,
+	type PeerAuth,
 } from "../src/types.ts";
 
 interface InjectedCall {
@@ -76,7 +78,8 @@ interface Stack {
 	pid: number;
 	address: PeerSocketAddress;
 	identity: PeerIdentity;
-	deps: PeerServiceDeps;
+	/** Services later steps drive directly (publish, key, send). */
+	deps: { registry: PeerRegistry; auth: PeerAuth; outbox: PeerOutbox };
 	host: FakeHost;
 	inbox: PeerInbox;
 	server: PeerServer | undefined;
@@ -116,20 +119,8 @@ describe("peers end-to-end", () => {
 			hopToken: randomBytes(4).toString("hex"),
 			tokens,
 		};
-		const deps: PeerServiceDeps = {
-			identity,
-			protocol,
-			transport,
-			auth,
-			registry,
-			guard,
-			pacer,
-			host,
-			outbox: undefined as unknown as PeerServiceDeps["outbox"],
-		};
-		const outbox = createPeerOutbox({ ...deps, peersDir });
-		deps.outbox = outbox;
-		const inbox: PeerInbox = createPeerInbox({ ...deps, outbox });
+		const outbox = createPeerOutbox({ identity, protocol, transport, auth, registry, pacer, host, peersDir });
+		const inbox: PeerInbox = createPeerInbox({ identity, protocol, transport, registry, guard, host, outbox });
 
 		const record: PeerRecord = {
 			version: 1,
@@ -156,7 +147,7 @@ describe("peers end-to-end", () => {
 			pid,
 			address,
 			identity,
-			deps,
+			deps: { registry, auth, outbox },
 			host,
 			inbox,
 			server: undefined,

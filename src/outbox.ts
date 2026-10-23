@@ -26,7 +26,7 @@ import {
 	PeerSendError,
 	type PeerSendOptions,
 	type PeerSendOutcome,
-	type PeerServiceDeps,
+	type PeerOutboxDeps,
 	type PeerUserFrame,
 } from "./types.ts";
 
@@ -53,7 +53,7 @@ export function candidateLine(refOf: (record: PeerRecord) => string, entry: Peer
  * Returns a discriminated union so callers render their own error text —
  * PeerSendError throwing stays reserved for the send phase.
  */
-export function createResolveLiveTarget(deps: PeerServiceDeps & { peersDir: string }): (target: string) => PeerLiveTargetResolution {
+export function createResolveLiveTarget(deps: PeerOutboxDeps): (target: string) => PeerLiveTargetResolution {
 	const { registry, transport } = deps;
 	return (target: string) => {
 		const resolution = registry.resolve(target);
@@ -111,7 +111,7 @@ export function createResolveLiveTarget(deps: PeerServiceDeps & { peersDir: stri
 // Outbox
 // ---------------------------------------------------------------------------
 
-export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): PeerOutbox {
+export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 	const { identity, protocol, transport, auth, registry, pacer, host } = deps;
 	const resolveLiveTarget = createResolveLiveTarget(deps);
 

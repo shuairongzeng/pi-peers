@@ -31,7 +31,7 @@ import {
 } from "../src/types.ts";
 
 // ---------------------------------------------------------------------------
-// Test doubles: in-memory fakes for the whole PeerServiceDeps surface
+// Test doubles: in-memory fakes for the PeerOutboxDeps/PeerInboxDeps surfaces
 // ---------------------------------------------------------------------------
 
 interface ScriptedHost extends PeerHost {
@@ -367,8 +367,6 @@ function makeScriptedOutbox(): ScriptedOutbox {
 describe("createPeerOutbox", () => {
 	const alphaEntry = entry();
 	const keyForAlpha = { pid: 4242, peerToken: "key-alpha" };
-	/** Placeholder for the self-referential outbox slot (the outbox never reads it). */
-	const outboxSlot = undefined as unknown as PeerOutbox;
 
 	it("sends a well-formed frame: auth line then user frame with all fields", async () => {
 		const transport = makeTransport();
@@ -379,11 +377,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth({ [alphaEntry.record.socketPath]: keyForAlpha }),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer,
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -436,11 +432,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth({ [alphaEntry.record.socketPath]: keyForAlpha }),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		await outbox.send("alpha", "body", {});
@@ -456,11 +450,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth({ [alphaEntry.record.socketPath]: keyForAlpha }),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		await outbox.send("alpha", "body", { notifyWhenIdle: true });
@@ -494,11 +486,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" }), [beta, dead, alphaEntry]),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -534,11 +524,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "ambiguous", candidates: [a1, a2] }), [a1, a2]),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -562,11 +550,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "unique", entry: dead })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		await expect(outbox.send("alpha", "hi", {})).rejects.toMatchObject({ code: "offline" });
@@ -579,11 +565,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		const error = await outbox.send("alpha", "hi", {}).then(
@@ -604,11 +588,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer,
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -632,11 +614,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth({ [alphaEntry.record.socketPath]: keyForAlpha }),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer,
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -653,11 +633,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth({ [alphaEntry.record.socketPath]: keyForAlpha }),
 			registry: makeRegistry(() => ({ kind: "unique", entry: alphaEntry })),
-			guard: makeGuard(),
 			pacer,
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -673,11 +651,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -696,11 +672,9 @@ describe("createPeerOutbox", () => {
 			transport,
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host: makeHost(),
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const address = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
 		transport.validAddresses.add(address);
@@ -729,11 +703,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host,
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -761,11 +733,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host,
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 
@@ -802,11 +772,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host,
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		outbox.registerOutbound("m-13");
@@ -823,11 +791,9 @@ describe("createPeerOutbox", () => {
 			transport: makeTransport(),
 			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
-			guard: makeGuard(),
 			pacer: makePacer(),
 			host,
 			peersDir: "/fake/peers",
-			outbox: outboxSlot,
 		};
 		const outbox = createPeerOutbox(deps);
 		outbox.registerOutbound("m-old");
@@ -861,10 +827,8 @@ describe("createPeerInbox", () => {
 			identity: makeIdentity(),
 			protocol: proto,
 			transport: opts.transport ?? makeTransport(),
-			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" }), opts.entries ?? []),
 			guard,
-			pacer: makePacer(),
 			host,
 			outbox,
 		};
@@ -1602,10 +1566,8 @@ describe("createPeerInbox", () => {
 			identity: makeIdentity(),
 			protocol: proto,
 			transport: makeTransport(),
-			auth: makeAuth(),
 			registry: makeRegistry(() => ({ kind: "none" })),
 			guard: makeGuard(),
-			pacer: makePacer(),
 			host,
 			outbox,
 		};
