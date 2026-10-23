@@ -4,6 +4,7 @@
  */
 
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -45,6 +46,14 @@ function fakeRecord(name: string, pid: number): PeerRecord {
 	};
 }
 
+/** list() sweeps live-pid records without an auth key: fixtures plant one. */
+function plantRecordWithKey(name: string, pid: number): void {
+	const record = fakeRecord(name, pid);
+	const hash = createHash("sha256").update(record.socketPath).digest("hex");
+	writeFileSync(join(peersDir, `${pid}.${hash}.key`), "{}");
+	writeFileSync(join(peersDir, `${pid}.json`), JSON.stringify(record));
+}
+
 interface FakeProc extends SpawnedProcess {
 	env?: NodeJS.ProcessEnv;
 	headless?: boolean;
@@ -55,10 +64,7 @@ function fakeExec(captured: { env?: NodeJS.ProcessEnv; headless?: boolean }): Pe
 	return (_command, _args, options) => {
 		captured.env = options.env;
 		captured.headless = options.headless;
-		writeFileSync(
-			join(peersDir, `${process.pid}.json`),
-			JSON.stringify(fakeRecord(options.env[ENV_PEERS_NAME] ?? "unset", process.pid)),
-		);
+		plantRecordWithKey(options.env[ENV_PEERS_NAME] ?? "unset", process.pid);
 		return { pid: process.pid, kill: () => {}, onError: () => {} };
 	};
 }
@@ -113,7 +119,7 @@ describe("createPeerSpawner", () => {
 		});
 		try {
 			const registry = createPeerRegistry(peersDir);
-			writeFileSync(join(peersDir, `${keeper.pid}.json`), JSON.stringify(fakeRecord("researcher", keeper.pid!)));
+			plantRecordWithKey("researcher", keeper.pid!);
 			const captured: { env?: NodeJS.ProcessEnv } = {};
 			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
 			const outcome = await spawner({});
@@ -198,6 +204,7 @@ describe("createPeerSpawner", () => {
 		// The stub writes its own registry record (its real pid) then stays alive.
 		const stub = `
 			const { writeFileSync } = require("node:fs");
+			const { createHash } = require("node:crypto");
 			const { hostname } = require("node:os");
 			const { join } = require("node:path");
 			const rec = {
@@ -207,6 +214,8 @@ describe("createPeerSpawner", () => {
 				pidDomain: "win32:" + hostname().toLowerCase(),
 				socketPath: "\\\\\\\\.\\\\pipe\\\\LOCAL\\\\stub", peerProtocol: 1, features: [],
 			};
+			const keyName = process.pid + "." + createHash("sha256").update(rec.socketPath).digest("hex") + ".key";
+			writeFileSync(join(process.env.${ENV_PEERS_DIR}, keyName), "{}");
 			writeFileSync(join(process.env.${ENV_PEERS_DIR}, process.pid + ".json"), JSON.stringify(rec));
 			setInterval(() => {}, 1000);
 		`;

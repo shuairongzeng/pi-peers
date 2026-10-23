@@ -4,11 +4,13 @@
  * Every peer publishes `<peersDir>/<pid>.json` plus zero or more `<pid>.<64hex>.key` auth-key
  * files. Scanning (`list()`) is self-healing: malformed records, records whose embedded pid
  * disagrees with their file name (torn writes), and records whose process is gone are deleted
- * on sight, so a crashed peer never shadows a name.
+ * on sight, so a crashed peer never shadows a name. A record whose process is alive but whose
+ * auth-key file is missing is a broken instance (unreachable for sends) and is swept the same
+ * way — production publish order is key-then-record, so a healthy startup never hits this.
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { PeerRecord, PeerRegistry, PeerRegistryEntry, PeerResolution } from "./types.ts";
@@ -275,6 +277,12 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		return join(peersDir, `${pid}.json`);
 	}
 
+	/** Expected auth-key file path for a record (same naming auth.publishKey uses). */
+	function keyPathFor(record: PeerRecord): string {
+		const hash = createHash("sha256").update(record.socketPath).digest("hex");
+		return join(peersDir, `${record.pid}.${hash}.key`);
+	}
+
 	function publish(record: PeerRecord): void {
 		mkdirSync(peersDir, { recursive: true, mode: 0o700 });
 		atomicWriteFileSync(recordPath(record.pid), JSON.stringify(record));
@@ -350,6 +358,15 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 			if (!live) {
 				// Stale record (process gone / pid reused): report once with live=false, then self-heal.
 				aliveCache.delete(record.pid); // Defensive: bury any verdict along with the record.
+				silentUnlink(path);
+				entries.push({ record, live: false });
+				continue;
+			}
+			// A live process without its auth key is a zombie: it can never
+			// authenticate inbound connections, so it is unreachable for sends.
+			// (Seen in the wild: an early orphan-sweep bug deleted a starting
+			// instance's key mid-boot.) Report once as dead and sweep.
+			if (!existsSync(keyPathFor(record))) {
 				silentUnlink(path);
 				entries.push({ record, live: false });
 				continue;

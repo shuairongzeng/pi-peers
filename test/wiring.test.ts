@@ -12,7 +12,7 @@
  */
 
 import { execFile, type ChildProcess, spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
@@ -476,6 +476,12 @@ describe("peers plugin wiring (dual-host)", () => {
 				join(peersDir, `${samePid}.json`),
 				JSON.stringify(peerRecord(samePid, { name: "here", cwd: peersDir, projectRoot: peersDir })),
 			);
+			// list() sweeps live-pid records without an auth key: plant both.
+			for (const pid of [otherPid, samePid]) {
+				const rec = peerRecord(pid);
+				const hash = createHash("sha256").update(rec.socketPath).digest("hex");
+				writeFileSync(join(peersDir, `${pid}.${hash}.key`), "{}");
+			}
 
 			const messages: string[] = [];
 			const notifyCtx = createFakeCtx(peersDir, {

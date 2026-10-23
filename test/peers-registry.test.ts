@@ -25,8 +25,19 @@ function freshRegistry(): PeerRegistry {
 	return registry;
 }
 
+/** Key file name for a record (same naming auth/registry use). */
+function keyFileName(record: PeerRecord): string {
+	const hash = createHash("sha256").update(record.socketPath).digest("hex");
+	return `${record.pid}.${hash}.key`;
+}
+
+/** list() sweeps live-pid records whose auth key is missing: fixtures plant one. */
+function plantKeyFor(record: PeerRecord): void {
+	writeFileSync(join(peersDir, keyFileName(record)), "{}");
+}
+
 function makeRecord(pid: number, overrides: Partial<PeerRecord> = {}): PeerRecord {
-	return {
+	const record: PeerRecord = {
 		version: 1,
 		pid,
 		sessionId: `session-${pid}`,
@@ -44,6 +55,12 @@ function makeRecord(pid: number, overrides: Partial<PeerRecord> = {}): PeerRecor
 		features: ["notify_idle"],
 		...overrides,
 	};
+	// Production order is key-then-record; planting at construction keeps every
+	// publish/direct-write fixture reachable under the key-consistency sweep.
+	// Dead-pid fixtures are swept by the pid check before keys matter — planting
+	// for them would only feed the orphan-key sweep an extra liveness probe.
+	if (pid !== DEAD_PID) plantKeyFor(record);
+	return record;
 }
 
 beforeAll(() => {
@@ -87,8 +104,9 @@ describe("publish/list round trip", () => {
 
 	it("publishes atomically, leaving no temp files behind", () => {
 		freshRegistry();
-		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
-		expect(visibleFileNames()).toEqual([`${LIVE_PID}.json`]);
+		const record = makeRecord(LIVE_PID, { name: "alice" });
+		registry.publish(record);
+		expect(visibleFileNames()).toEqual([keyFileName(record), `${LIVE_PID}.json`]);
 	});
 
 	it("creates the peers dir recursively when missing", () => {
@@ -120,9 +138,10 @@ describe("update", () => {
 
 	it("silently ignores update when no record exists", () => {
 		freshRegistry();
-		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		const record = makeRecord(LIVE_PID, { name: "alice" });
+		registry.publish(record);
 		registry.update(DEAD_PID, { status: "busy" });
-		expect(visibleFileNames()).toEqual([`${LIVE_PID}.json`]);
+		expect(visibleFileNames()).toEqual([keyFileName(record), `${LIVE_PID}.json`]);
 	});
 
 	it("silently ignores update when the record is corrupt JSON", () => {
@@ -182,6 +201,29 @@ describe("list self-healing", () => {
 		writeFileSync(keyFile, "key");
 		registry.list();
 		expect(existsSync(keyFile)).toBe(true);
+	});
+
+	it("sweeps a live-pid record whose auth key is missing (zombie worker)", () => {
+		freshRegistry();
+		// Plant the record WITHOUT its key: the instance is alive but can never
+		// authenticate inbound connections — unreachable, so it must not shadow
+		// the peer list. (Regression: a lost startup key left a permanent
+		// zombie that appeared sendable but failed with no_key.)
+		const record = makeRecord(LIVE_PID, { name: "zombie" }); // plants the key…
+		rmSync(join(peersDir, keyFileName(record)), { force: true }); // …then lose it
+		writeFileSync(recordFile(LIVE_PID), JSON.stringify(record));
+		const first = registry.list();
+		expect(first).toHaveLength(1);
+		expect(first[0]!.live).toBe(false);
+		expect(existsSync(recordFile(LIVE_PID))).toBe(false);
+	});
+
+	it("keeps a live-pid record whose key file exists", () => {
+		freshRegistry();
+		registry.publish(makeRecord(LIVE_PID, { name: "healthy" }));
+		const entries = registry.list();
+		expect(entries).toHaveLength(1);
+		expect(entries[0]!.live).toBe(true);
 	});
 
 	it("deletes orphan key files whose pid is dead", () => {
