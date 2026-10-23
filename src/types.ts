@@ -3,7 +3,7 @@
  *
  * This file is the single source of truth for the wire protocol, on-disk formats,
  * limits, and module interfaces of the peers extension. Every other module in this
- * directory imports from here. Design rationale: docs/peers.md.
+ * directory imports from here. Design rationale: README.md.
  *
  * Model: no central server. The filesystem is the shared truth (a registry directory
  * with one JSON record per live instance), and a per-instance IPC endpoint (Windows
@@ -116,9 +116,6 @@ export const PEER_PROTOCOL_VERSION = 1;
 export const PEER_FEATURE_NOTIFY_IDLE = "notify_idle";
 export const PEER_FEATURES: string[] = [PEER_FEATURE_NOTIFY_IDLE];
 
-/** Registry directory name inside a product agent dir (built-in layout only). */
-export const PEERS_DIR_NAME = "peers";
-/** Subdirectory of the registry dir holding POSIX socket files. */
 export const PEERS_SOCKETS_DIR_NAME = "socks";
 
 /** Windows pipe basename / namespace prefix: \\.\pipe\LOCAL\pi-peer-<32 hex>. */
@@ -412,6 +409,7 @@ export type PeerSendErrorCode =
 	| "timeout"
 	| "message_too_large"
 	| "sender_paced" // local pacing predicts the peer would drop us; merge and retry
+	| "protocol_version" // target speaks a newer wire protocol than us; upgrade this plugin
 	| "invalid_target";
 
 export class PeerSendError extends Error {
@@ -673,19 +671,11 @@ export interface PeerOutbox {
 /** inbox.ts */
 export type PeerAcceptPolicy = "ask" | "all" | "off";
 
-export interface PeerInboundResult {
-	/** What the sender should be told. */
-	receipt: PeerReceiptState;
-	reason?: string;
-}
-
 export interface PeerInbox {
 	/** Handle one authenticated inbound frame. May send receipts/notices via outbox. */
 	handleFrame(frame: PeerFrame, identity: "peer" | "child"): Promise<void>;
 	/** Called when the local agent becomes idle: fires one-shot notify_when_idle subscriptions. */
 	onIdle(): void;
-	/** Called on status transitions so queued-count bookkeeping stays exact. */
-	pendingCount(): number;
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@
  * by default (same git repo root); `scope: "all"` widens them to the whole machine. The
  * command lists the live peers from the registry.
  *
- * See types.ts for the module contract and docs/peers.md for the user-facing design.
+ * See types.ts for the module contract and README.md for the user-facing design.
  */
 
 import { randomUUID } from "node:crypto";
@@ -216,6 +216,7 @@ function describeSendError(
 		case "timeout":
 		case "message_too_large":
 		case "sender_paced":
+		case "protocol_version":
 			// Already actionable end to end (cause + remedy in the message).
 			return error.message;
 		case "invalid_target":
@@ -272,7 +273,8 @@ async function attemptSend(
  * with cross-project targets refused under the default scope. The ladder is
  * the outbox's shared resolveLiveTarget (the outbox owns the injected
  * transport, which does the connect-path→wire-address conversion); this
- * function only layers the project-scope gate on top.
+ * function layers the project-scope gate and the outbox's forward-compat
+ * protocol-version gate on top.
  */
 function resolveShutdownTarget(
 	deps: PeerToolDeps,
@@ -286,7 +288,22 @@ function resolveShutdownTarget(
 			return { ok: false, error: crossProject };
 		}
 	}
-	return deps.outbox.resolveLiveTarget(target);
+	const resolution = deps.outbox.resolveLiveTarget(target);
+	if (!resolution.ok) {
+		return resolution;
+	}
+	// Same forward-compat gate as the outbox's send(): refuse to build frames
+	// for a peer whose wire protocol is newer than ours.
+	if (resolution.entry.record.peerProtocol > PEER_PROTOCOL_VERSION) {
+		return {
+			ok: false,
+			error: new PeerSendError(
+				"protocol_version",
+				`peer "${resolution.entry.record.name}" speaks wire protocol v${resolution.entry.record.peerProtocol}, this plugin speaks v${PEER_PROTOCOL_VERSION} — upgrade the pi-peers plugin`,
+			),
+		};
+	}
+	return resolution;
 }
 
 /**
@@ -475,9 +492,9 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 			};
 			if (failures === params.to.length) {
 				result.isError = true;
-			} else if (failures > 0) {
-				result.isError = false;
 			}
+			// Partial failure is intentionally NOT isError: the agent must read
+			// the per-target lines to see which sends failed.
 			return result;
 		},
 	};

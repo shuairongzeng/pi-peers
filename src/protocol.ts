@@ -5,7 +5,7 @@
  * Inbound lines are untrusted: `parseFrameLine()` and `parseAuthLine()` never throw — any
  * malformed input returns undefined so the caller can drop the connection. `parsePeerContent()`
  * enforces byte-exact round-trip fidelity, so a forged or hand-edited wrapper never reaches the
- * receiving agent. Design rationale: docs/peers.md; contract: ./types.ts.
+ * receiving agent. Design rationale: README.md; contract: ./types.ts.
  */
 
 import { randomUUID } from "node:crypto";

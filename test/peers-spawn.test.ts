@@ -11,7 +11,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPeerRegistry } from "../src/registry.ts";
 import { createPeerSpawner, hostCommand, type PeerExec, type SpawnedProcess } from "../src/spawn.ts";
-import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, PeerSendError, type PeerRecord } from "../src/types.ts";
+import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, PeerSendError, PeerSpawnError, type PeerRecord } from "../src/types.ts";
 
 let peersDir: string;
 
@@ -280,6 +280,89 @@ describe("createPeerSpawner", () => {
 			expect(outcome.name).toBe("stub-worker");
 			expect(outcome.pid).toBe(child?.pid);
 		} finally {
+			child?.kill();
+		}
+	}, 20_000);
+
+	it("visible spawn on POSIX: actionable spawn_failed instead of a cryptic ENOENT", async () => {
+		// The guard is platform-conditional and Windows CI cannot hit the real
+		// POSIX path, so simulate one: patch process.platform (defaultExec reads
+		// it per call, never captured at module load). Without the guard,
+		// nodeSpawn("cmd.exe", …) fails ENOENT and the caller would get a
+		// generic "failed to launch: spawn cmd.exe ENOENT".
+		const realPlatform = process.platform;
+		const descriptor = Object.getOwnPropertyDescriptor(process, "platform") ?? {
+			enumerable: true,
+			configurable: true,
+			value: realPlatform,
+		};
+		Object.defineProperty(process, "platform", { ...descriptor, value: "linux" });
+		try {
+			const registry = createPeerRegistry(peersDir);
+			// defaultExec (no injected exec) + headless omitted → visible branch.
+			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir });
+			// The guard throws directly: the exact message reaches the caller
+			// unwrapped (not the generic "failed to launch: …" onError wrap).
+			await expect(spawner({ name: "visible-worker" })).rejects.toMatchObject({
+				name: "PeerSpawnError",
+				kind: "spawn_failed",
+				message: "visible (windowed) spawn is Windows-only for now; pass headless: true to spawn a background worker on this platform",
+			});
+		} finally {
+			Object.defineProperty(process, "platform", { ...descriptor, value: realPlatform });
+		}
+	});
+
+	it("register timeout: a real headless child that never registers is killed", async () => {
+		// REAL exec (no fake): the child is a live node keeper (setInterval, no
+		// registry record ever). The spawner must time out AND its cleanup path
+		// must actually kill the child. Liveness is proven by awaiting the
+		// child's own "exit" event (the platform's authoritative dead-signal)
+		// rather than a wall-clock sleep; vitest's 20s test timeout bounds a
+		// failed kill. kill(pid, 0) afterwards must throw ESRCH.
+		let child: ChildProcess | undefined;
+		// Gate that resolves on the child's real "exit" — attached at spawn
+		// time (before the spawner can kill) so no exit can slip past us.
+		const { promise: exited, resolve: markExited } = Promise.withResolvers<void>();
+		const keeperExec: PeerExec = (_command, _args, options) => {
+			// Swap the host command for the keeper stub while honoring the
+			// headless exec contract: detached, cwd outside the registry dir
+			// (a live child's cwd would pin peersDir against rmSync), stdin
+			// pipe held open.
+			const proc = nodeSpawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+				cwd: tmpdir(),
+				env: options.env,
+				detached: true,
+				stdio: ["pipe", "ignore", "ignore"],
+			});
+			proc.stdin?.on("error", () => {}); // Held open, never written.
+			// The keeper cannot die on its own (a bare interval): its exit can
+			// only be the spawner's cleanup kill.
+			proc.once("exit", () => markExited());
+			child = proc;
+			return { pid: proc.pid, kill: () => proc.kill(), onError: (cb) => proc.once("error", cb) };
+		};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => tmpdir(),
+			registerTimeoutMs: 300,
+			exec: keeperExec,
+		});
+		try {
+			await expect(spawner({ name: "never-registers", headless: true })).rejects.toMatchObject({
+				name: "PeerSpawnError",
+				kind: "register_timeout",
+			});
+			const pid = child?.pid;
+			if (child === undefined || pid === undefined) throw new Error("keeper never spawned");
+			// A leaked (never-killed) child hangs here and the 20s test timeout
+			// names the leak — no wall-clock sleep involved.
+			await exited;
+			expect(() => process.kill(pid, 0)).toThrow();
+		} finally {
+			// Belt and braces: never leak the keeper even when an assertion fails.
 			child?.kill();
 		}
 	}, 20_000);

@@ -834,13 +834,10 @@ describe("createPeerOutbox", () => {
 		outbox.handleReceipt(statusFrame({ msg_id: "m-old", state: "held" }));
 		expect(outbox.receiptOf("m-old")).toBe("held");
 
-		const now = Date.now;
-		const advance = async (ms: number) => {
-			(Date.now as unknown as () => number) = () => now() + ms;
-		};
-		await advance(PEER_RECEIPT_TTL_MS + 1);
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + PEER_RECEIPT_TTL_MS + 1);
 		expect(outbox.receiptOf("m-old")).toBeUndefined();
-		(Date.now as unknown as () => number) = now;
+		vi.useRealTimers();
 	});
 });
 
@@ -881,7 +878,6 @@ describe("createPeerInbox", () => {
 		await inbox.handleFrame(frame, "child");
 
 		expect(host.injected).toEqual([{ content: frame.content, priority: frame.priority }]);
-		expect(guard.checks).toEqual([]);
 		expect(guard.accepted).toEqual([]);
 		expect(host.confirmCalls).toEqual([]);
 		expect(outbox.controlCalls.length).toBe(1);
@@ -894,7 +890,7 @@ describe("createPeerInbox", () => {
 		expect(receiptFrame.reason).toBeUndefined();
 		expect(receiptFrame.from).toBe(`pipe:LOCAL\\pi-peer-${"f".repeat(32)}`);
 		expect(receiptFrame.fromName).toBe("me");
-		expect(inbox.pendingCount()).toBe(1);
+		expect(guard.checks).toEqual([]);
 	});
 
 	it("guard rejection drops the message with the guard's reason", async () => {
@@ -910,7 +906,6 @@ describe("createPeerInbox", () => {
 		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
 		expect(status.state).toBe("dropped");
 		expect(status.reason).toBe("rate-limited");
-		expect(inbox.pendingCount()).toBe(0);
 	});
 
 	it("accept policy off refuses the message", async () => {
@@ -942,7 +937,6 @@ describe("createPeerInbox", () => {
 		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
 		expect(status.state).toBe("dropped");
 		expect(status.reason).toBe("malformed-wrapper");
-		expect(inbox.pendingCount()).toBe(0);
 	});
 
 	it("a tampered wrapper is dropped with a malformed-wrapper receipt", async () => {
@@ -1032,7 +1026,6 @@ describe("createPeerInbox", () => {
 		const states = outbox.controlCalls.map((c) => (c.frame as PeerMessageStatusFrame).state);
 		expect(states).toEqual(["held", "delivered"]);
 		expect(host.injected.length).toBe(1);
-		expect(inbox.pendingCount()).toBe(1);
 	});
 
 	it("ask: truncates the preview to 500 chars", async () => {
@@ -1081,17 +1074,15 @@ describe("createPeerInbox", () => {
 		expect(host.injected).toEqual([]);
 		expect(guard.refunded).toEqual([frame.from]);
 		expect(guard.accepted).toEqual([frame.from]);
-		expect(inbox.pendingCount()).toBe(0);
 		const status = outbox.controlCalls[0]!.frame as PeerMessageStatusFrame;
 		expect(status.state).toBe("dropped");
 		expect(status.reason).toContain("inject-failed");
 	});
 
-	it("acceptedSinceIdle grows and is passed to the guard", async () => {
+	it("queuedCount grows and is passed to the guard", async () => {
 		const { inbox, guard } = makeInbox({ host: { policy: "all" } });
 		await inbox.handleFrame(userFrame({ msg_id: "i1" }), "peer");
 		await inbox.handleFrame(userFrame({ msg_id: "i2", body: "second" }), "peer");
-		expect(inbox.pendingCount()).toBe(2);
 		expect(guard.checks.map((c) => c.queued)).toEqual([0, 1]);
 	});
 
@@ -1320,11 +1311,16 @@ describe("createPeerInbox", () => {
 	});
 
 	it("onIdle resets the queued count", async () => {
-		const { inbox } = makeInbox({ host: { policy: "all" } });
+		const { inbox, guard } = makeInbox({ host: { policy: "all" } });
 		await inbox.handleFrame(userFrame(), "peer");
-		expect(inbox.pendingCount()).toBe(1);
+		await inbox.handleFrame(userFrame({ msg_id: "i2", body: "second" }), "peer");
+		expect(guard.checks.map((c) => c.queued)).toEqual([0, 1]);
+
 		inbox.onIdle();
-		expect(inbox.pendingCount()).toBe(0);
+
+		// The count the guard sees starts over at 0 after the idle transition.
+		await inbox.handleFrame(userFrame({ msg_id: "i3", body: "third" }), "peer");
+		expect(guard.checks.map((c) => c.queued)).toEqual([0, 1, 0]);
 	});
 
 	it("receipt delivery failures never break message processing", async () => {
@@ -1707,7 +1703,6 @@ describe("createPeerInbox", () => {
 		expect(host.injected).toEqual([]);
 		expect(outbox.controlCalls).toEqual([]);
 		expect(guard.childChecks).toEqual([frame.from, frame.from]);
-		expect(inbox.pendingCount()).toBe(0);
 	});
 
 	it("idleSubs: the 65th subscription evicts the oldest", async () => {

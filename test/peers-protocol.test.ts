@@ -61,6 +61,30 @@ function idleNoticeFrame(overrides: Record<string, unknown> = {}): PeerFrame {
 	} as PeerFrame;
 }
 
+function shutdownFrame(overrides: Record<string, unknown> = {}): PeerFrame {
+	return {
+		msgV: PEER_PROTOCOL_VERSION,
+		msg_id: "11111111-2222-3333-4444-555555555555",
+		type: "control",
+		action: "shutdown",
+		from: `pipe:LOCAL\\pi-peer-${"a".repeat(32)}`,
+		...overrides,
+	} as PeerFrame;
+}
+
+function shutdownResponseFrame(overrides: Record<string, unknown> = {}): PeerFrame {
+	return {
+		msgV: PEER_PROTOCOL_VERSION,
+		msg_id: "11111111-2222-3333-4444-555555555555",
+		type: "control",
+		action: "shutdown_response",
+		inReplyTo: "m-orig",
+		from: `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`,
+		outcome: "accepted",
+		...overrides,
+	} as PeerFrame;
+}
+
 function objLine(obj: object): string {
 	return JSON.stringify(obj);
 }
@@ -180,6 +204,16 @@ describe("createPeerProtocol", () => {
 			[objLine({ ...notifyWhenIdleFrame(), nonce: 3 }), "nonce as number"],
 			[objLine({ ...idleNoticeFrame(), from: true }), "idle notice from as boolean"],
 			[objLine({ ...idleNoticeFrame(), fromName: {} }), "idle notice fromName as object"],
+			[objLine({ msgV: 1, msg_id: "m1", type: "control", action: "shutdown" }), "shutdown missing from"],
+			[objLine({ ...shutdownFrame(), reason: 42 }), "shutdown reason as number"],
+			[objLine({ ...shutdownFrame(), reason: null }), "shutdown reason as null"],
+			[objLine({ msgV: 1, msg_id: "m1", type: "control", action: "shutdown_response" }), "shutdown_response missing inReplyTo"],
+			[objLine({ ...shutdownResponseFrame(), inReplyTo: 99 }), "shutdown_response inReplyTo as number"],
+			[objLine({ ...shutdownResponseFrame(), outcome: 7 }), "shutdown_response outcome as number"],
+			[objLine({ msgV: 1, msg_id: "m1", type: "control", action: "shutdown_response", inReplyTo: "o", from: "x" }), "shutdown_response missing result"],
+			[objLine({ ...shutdownResponseFrame(), outcome: "held" }), "shutdown_response with invalid state value"],
+			[objLine({ ...shutdownResponseFrame(), outcome: "ACCEPTED" }), "shutdown_response outcome wrong case"],
+			[objLine({ ...shutdownResponseFrame(), reason: false }), "shutdown_response reason as boolean"],
 		];
 
 		for (const [line, label] of badLines) {
@@ -192,6 +226,16 @@ describe("createPeerProtocol", () => {
 			for (const [line] of badLines) {
 				expect(() => protocol.parseFrameLine(line)).not.toThrow();
 			}
+		});
+
+		it("parses a valid shutdown frame (positive control)", () => {
+			const frame = shutdownFrame({ fromName: "alpha", reason: "work finished" });
+			expect(protocol.parseFrameLine(objLine(frame))).toEqual(frame);
+		});
+
+		it("parses a valid shutdown_response frame (positive control)", () => {
+			const frame = shutdownResponseFrame({ fromName: "beta", outcome: "denied", reason: "user declined" });
+			expect(protocol.parseFrameLine(objLine(frame))).toEqual(frame);
 		});
 	});
 

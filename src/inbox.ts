@@ -6,7 +6,7 @@
  * being injected into the local agent; control frames update receipt state,
  * register one-shot notify_when_idle subscriptions, or surface idle notices.
  *
- * See types.ts for the module contract and docs/peers.md for the user-facing design.
+ * See types.ts for the module contract and README.md for the user-facing design.
  */
 
 import {
@@ -58,12 +58,12 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	const { identity, protocol, transport, guard, host } = deps;
 
 	/**
-	 * Number of peer messages accepted since the last idle transition. Not a
+	 * Count of messages accepted since the last idle transition. Not a
 	 * real queue: injected messages are not waiting for the agent — this is a
 	 * documented cap so a busy stretch cannot hide rate/dedup signals from the
 	 * guard (guard sees an ever-growing count, and the reset-on-idle bounds it).
 	 */
-	let acceptedSinceIdle = 0;
+	let queuedCount = 0;
 	/** One-shot notify_when_idle subscriptions, keyed by their envelope msg_id. */
 	const idleSubs = new Map<string, IdleSub>();
 
@@ -82,7 +82,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			action: "peer_message_status",
 			msg_id: original.msg_id,
 			from: identity.socketAddress,
-			fromName: identity.name,
+			...(identity.name !== "" ? { fromName: identity.name } : {}),
 			state,
 			...(reason !== undefined ? { reason } : {}),
 		};
@@ -270,7 +270,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			return;
 		}
 
-		const verdict = guard.check(frame.from, frame, identity.hopToken, acceptedSinceIdle);
+		const verdict = guard.check(frame.from, frame, identity.hopToken, queuedCount);
 		if (!verdict.ok) {
 			const reason =
 				verdict.reason === "queue-full"
@@ -324,11 +324,11 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 		if (senderClass !== "child") {
 			guard.recordAccepted(frame.from, frame);
 		}
-		acceptedSinceIdle++;
+		queuedCount++;
 		try {
 			await host.injectUserMessage(content, frame.priority);
 		} catch (error) {
-			acceptedSinceIdle--;
+			queuedCount--;
 			if (senderClass !== "child") {
 				guard.refund(frame.from);
 			}
@@ -428,7 +428,7 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			type: "control",
 			action: "peer_idle_notice",
 			from: identity.socketAddress,
-			fromName: identity.name,
+			...(identity.name !== "" ? { fromName: identity.name } : {}),
 			...(sub.nonce !== undefined ? { nonce: sub.nonce } : {}),
 		};
 		void deps.outbox.sendControl(sub.replyTo, notice);
@@ -438,15 +438,11 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 	function onIdle(): void {
 		const subs = Array.from(idleSubs.values());
 		idleSubs.clear();
-		acceptedSinceIdle = 0;
+		queuedCount = 0;
 		for (const sub of subs) {
 			sendIdleNotice(sub);
 		}
 	}
 
-	function pendingCount(): number {
-		return acceptedSinceIdle;
-	}
-
-	return { handleFrame, onIdle, pendingCount };
+	return { handleFrame, onIdle };
 }

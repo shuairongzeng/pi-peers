@@ -7,12 +7,13 @@
  * opens one short-lived connection, and writes the auth line followed by the
  * frame (plus an optional notify_when_idle subscription). Also tracks
  *
- * See types.ts for the module contract and docs/peers.md for the user-facing design.
+ * See types.ts for the module contract and README.md for the user-facing design.
  */
 
 import { randomUUID } from "node:crypto";
 import {
 	PEER_FEATURE_NOTIFY_IDLE,
+	PEER_PROTOCOL_VERSION,
 	PEER_RECEIPT_TTL_MS,
 	type PeerConnection,
 	type PeerControlFrame,
@@ -228,6 +229,15 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 		}
 		const { entry, address } = resolved;
 		const record = entry.record;
+		// Forward-compat gate: a peer speaking a NEWER wire protocol than us
+		// may have changed frames we cannot safely build; refuse up front
+		// instead of writing frames the peer would reject or misparse.
+		if (record.peerProtocol > PEER_PROTOCOL_VERSION) {
+			throw new PeerSendError(
+				"protocol_version",
+				`peer "${record.name}" speaks wire protocol v${record.peerProtocol}, this plugin speaks v${PEER_PROTOCOL_VERSION} — upgrade the pi-peers plugin`,
+			);
+		}
 
 		// Token computed ONCE per send: the parent's child token when the target
 		// is our own parent (so it classifies us as "child" — no key file read),
@@ -253,14 +263,14 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			from: identity.socketAddress,
 			fromPid: identity.pid,
 			fromSession: identity.sessionId,
-			...(identity.name !== undefined && identity.name !== "" ? { fromName: identity.name } : {}),
+			...(identity.name !== "" ? { fromName: identity.name } : {}),
 			hopChain: [identity.hopToken],
 			priority: opts.priority ?? "next",
 			content: protocol.wrapPeerContent(
 				{
 					from: identity.socketAddress,
 					fromSession: identity.sessionId,
-					...(identity.name !== undefined && identity.name !== "" ? { fromName: identity.name } : {}),
+					...(identity.name !== "" ? { fromName: identity.name } : {}),
 				},
 				body,
 			),
@@ -282,7 +292,7 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 				action: "notify_when_idle",
 				reply_to: identity.socketAddress,
 				from: identity.socketAddress,
-				...(identity.name !== undefined && identity.name !== "" ? { fromName: identity.name } : {}),
+				...(identity.name !== "" ? { fromName: identity.name } : {}),
 				nonce: notifyNonce,
 			};
 			lines.push(protocol.serializeFrame(notifyFrame));

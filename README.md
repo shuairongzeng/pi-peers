@@ -68,7 +68,7 @@ Tool reference (what the model sees):
 | `… { notifyWhenIdle: true }` | One-shot ping back to you when the peer goes idle — fires immediately if the peer is already idle. (Single-target sends only.) |
 | `… { action: "shutdown", to, reason? }` | Ask a peer to close its session gracefully (same project scoping as send). The peer obeys its own accept policy: `all` closes immediately, `ask` prompts the human there, `off` refuses. Collect the peer's results **before** shutting it down. |
 | `… { scope: "all" }` | Reach sessions in **other projects** (see below). |
-| `spawn_peer { name?, task?, headless?, ephemeral? }` | Launch a NEW agent instance as a managed peer. It reproduces your own host invocation (same binary/build), registers automatically, and is addressable by `name` right away. `task` is delivered the moment it comes online. `headless: true` runs it in the background (no terminal window); `ephemeral: true` makes it exit automatically once it has done its work and reported back. |
+| `spawn_peer({ name?, task?, headless?, ephemeral? })` | Launch a NEW agent instance as a managed peer. It reproduces your own host invocation (same binary/build), registers automatically, and is addressable by `name` right away. `task` is delivered the moment it comes online. `headless: true` runs it in the background (no terminal window); `ephemeral: true` makes it exit automatically once it has done its work and reported back. Windowed (non-headless) spawns are Windows-only for now — on macOS/Linux pass `headless: true`. |
 
 ### Project scope
 

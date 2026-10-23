@@ -526,8 +526,9 @@ describe("createPeerMessageTool batch sends", () => {
 			expect(opts).toEqual({ priority: undefined, notifyWhenIdle: undefined });
 		}
 		// The offline peer (gamma) is the classic one-target failure; alpha and
-		// beta succeed, so the batch is a partial success, not an error.
-		expect(result.isError).toBe(false);
+		// beta succeed, so the batch is a partial success, not an error:
+		// isError stays unset (the default falsy) so the agent reads the lines.
+		expect(result.isError).toBeUndefined();
 		const text = textOf(result);
 		expect(text).toContain("✓ alpha — sent (msg_id msg-alph…)");
 		expect(text).toContain("✓ beta — sent (msg_id msg-beta…)");
@@ -589,7 +590,7 @@ describe("createPeerMessageTool batch sends", () => {
 		// gamma lives in D:/work/gamma: the scope gate refuses it before the
 		// outbox, while alpha goes through.
 		expect(calls).toEqual(["alpha"]);
-		expect(result.isError).toBe(false);
+		expect(result.isError).toBeUndefined();
 		const text = textOf(result);
 		expect(text).toContain("✓ alpha — sent (msg_id msg-alph…)");
 		expect(text).toContain("✗ gamma:");
@@ -615,7 +616,7 @@ describe("createPeerMessageTool batch sends", () => {
 		// once, in first-seen order.
 		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alpha, beta, gamma], ownPid: 100 }));
 		const result = await runTool(tool, { to: ["alpha", "beta", "ghost"], message: "hi" }, "D:/work/alpha");
-		expect(result.isError).toBe(false);
+		expect(result.isError).toBeUndefined();
 		const text = textOf(result);
 		expect(text).toContain("1 of 3 targets; 2 failed (1 offline, 1 invalid_target).");
 	});
@@ -955,8 +956,21 @@ describe("createPeerMessageTool action=shutdown", () => {
 		expect(result.isError).toBe(true);
 		const text = textOf(result);
 		expect(text).toContain("another project");
-		expect(text).toContain("D:/work/beta");
 		expect(text).toContain('scope: "all"');
+	});
+
+	it("shutdown refuses a peer speaking a newer wire protocol, naming both versions", async () => {
+		const alphaV2 = { ...alpha, peerProtocol: 2 };
+		const { outbox } = makeShutdownOutbox([selfRecord, alphaV2]);
+		const tool = createPeerMessageTool(fakeDeps({ outbox, entries: [selfRecord, alphaV2], ownPid: 100 }));
+		const result = await runTool(tool, { action: "shutdown", to: "alpha" }, "D:/work/alpha");
+		expect(outbox.controlCalls).toHaveLength(0);
+		expect(result.isError).toBe(true);
+		const text = textOf(result);
+		// The message names BOTH versions: the peer's and ours, and the fix.
+		expect(text).toBe(
+			'peer "alpha" speaks wire protocol v2, this plugin speaks v1 — upgrade the pi-peers plugin',
+		);
 	});
 });
 

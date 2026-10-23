@@ -79,6 +79,20 @@ const defaultExec: PeerExec = (command, args, options) => {
 	}
 	// Visible terminal window. `start ""` owns the console; the returned pid is
 	// the intermediate shell's and unused — the registry name is the handle.
+	// POSIX: `cmd.exe` does not exist, so this spawn would fail with a cryptic
+	// ENOENT "spawn_failed". Guard on platform BEFORE spawning and throw
+	// directly — createPeerSpawner is an async function, so the error
+	// propagates to its caller unchanged (the "failed to launch:" wrap is for
+	// errors the wait loop observes via onError; a pre-flight check has no
+	// child to clean up and must not wait for the poll loop). The check reads
+	// the global `process` per call (never captured at module load) so tests
+	// can simulate a POSIX host by patching process.platform.
+	if (process.platform !== "win32") {
+		throw new PeerSpawnError(
+			"spawn_failed",
+			"visible (windowed) spawn is Windows-only for now; pass headless: true to spawn a background worker on this platform",
+		);
+	}
 	const child = nodeSpawn("cmd.exe", ["/c", "start", "", command, ...args], {
 		cwd: options.cwd,
 		env: options.env,

@@ -451,5 +451,42 @@ describe("createPeerOutbox token resolution", () => {
 		const authLine = JSON.parse(transport.sessions[0]!.lines[0]!) as { token: string };
 		expect(authLine.token).toBe("child-token-42");
 		expect(auth.lookupCalls).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// Forward-compat protocol version gate
+// ---------------------------------------------------------------------------
+
+describe("createPeerOutbox protocol version gate", () => {
+	it("send refuses a peer speaking a newer wire protocol, naming both versions", async () => {
+		const futureEntry = entry({ peerProtocol: 2 });
+		const deps = makeDeps({ registry: makeRegistry(() => ({ kind: "unique", entry: futureEntry })) });
+		const outbox = createPeerOutbox(deps);
+		const transport = deps.transport as FakeTransport;
+
+		const error = await outbox.send("alpha", "hi", {}).then(
+			() => undefined,
+			(e) => e,
+		);
+
+		expect(error).toBeInstanceOf(PeerSendError);
+		expect(error.code).toBe("protocol_version");
+		// The message names BOTH versions: the peer's and ours.
+		expect(error.message).toBe(
+			'peer "alpha" speaks wire protocol v2, this plugin speaks v1 — upgrade the pi-peers plugin',
+		);
+		// Refused up front: nothing was written to the wire and no key was
+		// looked up (the gate precedes token resolution).
+		expect(transport.connects).toEqual([]);
 	});
+
+	it("send proceeds when the peer speaks an older or equal protocol", async () => {
+		const sameEntry = entry({ peerProtocol: 1 });
+		const deps = makeDeps({ registry: makeRegistry(() => ({ kind: "unique", entry: sameEntry })) });
+		const outbox = createPeerOutbox(deps);
+
+		const outcome = await outbox.send("alpha", "hi", {});
+		expect(outcome.msgId).toBeTruthy();
+	});
+});
 });
