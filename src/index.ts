@@ -378,7 +378,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		}
 	};
 
-	const spawner = createPeerSpawner({ registry, outbox, cwd: () => ctx?.cwd ?? process.cwd() });
+	// Aborts pending spawn waits on real shutdown so they don't poll a dying session.
+	const spawnAbort = new AbortController();
+
+	const spawner = createPeerSpawner({ registry, outbox, cwd: () => ctx?.cwd ?? process.cwd(), signal: spawnAbort.signal });
 	pi.registerTool(createPeerMessageTool({ outbox, registry, identity, spawner }));
 	pi.registerTool(createPeerSpawnTool({ outbox, registry, identity, spawner }));
 
@@ -553,6 +556,7 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		// Stop admitting inbound work before unpublishing: anything accepted after
 		// this point would be acknowledged yet never read.
 		closing = true;
+		spawnAbort.abort();
 		cleanup();
 		const s = server;
 		server = undefined;

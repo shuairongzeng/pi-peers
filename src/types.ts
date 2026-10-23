@@ -579,6 +579,12 @@ export interface PeerRegistry {
 	refOf(record: PeerRecord): string;
 	/** Liveness probe: kill(pid,0) plus procStart match when both sides expose one. */
 	isAlive(record: PeerRecord): boolean;
+	/**
+	 * Drop a cached "live" verdict for a pid so the next probe is real.
+	 * Self-heals stale cache entries after a failed connect (a process that
+	 * just died can sit in the liveness cache for up to its TTL).
+	 */
+	invalidateAlive(pid: number): void;
 	/** Best-effort process start token (Linux /proc/<pid>/stat starttime; undefined elsewhere). */
 	readProcStart(pid: number): string | undefined;
 	/** This machine's pidDomain string. */

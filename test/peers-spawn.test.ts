@@ -201,6 +201,96 @@ describe("createPeerSpawner", () => {
 		await expect(spawner({ name: "ghost" })).rejects.toMatchObject({ kind: "register_timeout" });
 	});
 
+	it("successful registration refreshes the scan cache for subsequent listings", async () => {
+		// The headless wait finds the record via readRecord (no scan); without
+		// a forced post-success rescan, the cached listing from the pre-spawn
+		// name scan would hide the new peer for the cache TTL window.
+		const registry = createPeerRegistry(peersDir);
+		const list = registry.list.bind(registry);
+		const freshSawPeer: boolean[] = [];
+		registry.list = (opts?: { fresh?: boolean }) => {
+			const entries = list(opts);
+			if (opts?.fresh === true) {
+				freshSawPeer.push(entries.some((entry) => entry.record.name === "cache-refresh"));
+			}
+			return entries;
+		};
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			exec: fakeExec({}),
+		});
+		const outcome = await spawner({ name: "cache-refresh", headless: true });
+		expect(outcome.name).toBe("cache-refresh");
+		// Pre-spawn name scan sees no record; the forced post-success rescan is
+		// the one fresh call that sees the new peer.
+		expect(freshSawPeer.filter((saw) => saw)).toHaveLength(1);
+		// …so a cached (non-fresh) listing includes the new peer immediately.
+		expect(registry.list().some((entry) => entry.record.name === "cache-refresh")).toBe(true);
+	});
+
+	it("abort before spawn: rejects with the shutdown message and starts no child", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		let execCalls = 0;
+		const exec: PeerExec = () => {
+			execCalls += 1;
+			return { pid: 1, kill: () => {}, onError: () => {} };
+		};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			exec,
+			signal: controller.signal,
+		});
+		await expect(spawner({ name: "never-started", headless: true })).rejects.toMatchObject({
+			name: "PeerSpawnError",
+			kind: "spawn_failed",
+			message: "spawn aborted: session is shutting down",
+		});
+		expect(execCalls).toBe(0);
+	});
+
+	it("abort mid-wait: rejects promptly and the poll loop stops", async () => {
+		// The child stub never registers; only the abort (not the long register
+		// timeout) may end this wait.
+		const controller = new AbortController();
+		const registry = createPeerRegistry(peersDir);
+		const readRecord = registry.readRecord.bind(registry);
+		let polls = 0;
+		registry.readRecord = (pid) => {
+			polls += 1;
+			// Shut the session down mid-wait, after two poll iterations.
+			if (polls === 2) controller.abort();
+			return readRecord(pid);
+		};
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 30_000,
+			exec: () => ({ pid: 12345, kill: () => {}, onError: () => {} }),
+			signal: controller.signal,
+		});
+		const startedAt = Date.now();
+		await expect(spawner({ name: "held-worker", headless: true })).rejects.toMatchObject({
+			name: "PeerSpawnError",
+			kind: "spawn_failed",
+			message: "spawn aborted: session is shutting down",
+		});
+		expect(Date.now() - startedAt).toBeLessThan(2_000);
+		expect(polls).toBe(2);
+		// The loop is really dead: 400ms exceeds the 300ms poll interval, so a
+		// zombie loop would land another readRecord here.
+		const { promise: settleWindow, resolve: settlePassed } = Promise.withResolvers<void>();
+		setTimeout(settlePassed, 400);
+		await settleWindow;
+		expect(polls).toBe(2);
+	});
+
 	it("headless: ignores a stale same-name record for the child pid", async () => {
 		// A recycled pid's older record: same assigned name, startedAt 10s before
 		// the spawn call — outside the 5s grace window, must not be matched. Planted

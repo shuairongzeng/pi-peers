@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { createPeerOutbox } from "../src/outbox.ts";
 import {
 	PEER_MAX_MESSAGE_BYTES,
@@ -167,7 +167,12 @@ function entry(rec: Partial<PeerRegistryEntry["record"]> = {}, live = true): Pee
 	};
 }
 
-function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: PeerRegistryEntry[] = []): PeerRegistry {
+/** Registry fake; `invalidateAlive` defaults to a no-op but is swappable for spy tests. */
+function makeRegistry(
+	resolveImpl: (name: string) => PeerResolution,
+	entries: PeerRegistryEntry[] = [],
+	invalidateAlive: (pid: number) => void = () => {},
+): PeerRegistry {
 	return {
 		publish: () => {},
 		update: () => {},
@@ -181,6 +186,7 @@ function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: Pe
 		isAlive: () => true,
 		readProcStart: () => undefined,
 		pidDomain: () => "win32:box",
+		invalidateAlive,
 	};
 }
 
@@ -614,6 +620,60 @@ describe("createPeerOutbox protocol version gate", () => {
 
 		const outcome = await outbox.send("alpha", "hi", {});
 		expect(outcome.msgId).toBeTruthy();
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Liveness self-heal on connect failure
+// ---------------------------------------------------------------------------
+
+describe("createPeerOutbox liveness self-heal", () => {
+	it("a failed connect to a live-resolved target invalidates its cached verdict", async () => {
+		const transport = makeTransport();
+		transport.failConnect = true;
+		const invalidateAlive = vi.fn();
+		const deps = makeDeps({
+			transport,
+			registry: makeRegistry(() => ({ kind: "unique", entry: entry() }), [], invalidateAlive),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		await expect(outbox.send("alpha", "hi", {})).rejects.toMatchObject({ code: "connect_failed" });
+		expect(invalidateAlive).toHaveBeenCalledTimes(1);
+		expect(invalidateAlive).toHaveBeenCalledWith(4242); // entry().record.pid
+	});
+
+	it("a timeout to a live-resolved target invalidates its cached verdict", async () => {
+		const transport = makeTransport({
+			connect: () => Promise.reject(new PeerSendError("timeout", "timed out")),
+		});
+		const invalidateAlive = vi.fn();
+		const deps = makeDeps({
+			transport,
+			registry: makeRegistry(() => ({ kind: "unique", entry: entry() }), [], invalidateAlive),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		await expect(outbox.send("alpha", "hi", {})).rejects.toMatchObject({ code: "timeout" });
+		expect(invalidateAlive).toHaveBeenCalledTimes(1);
+		expect(invalidateAlive).toHaveBeenCalledWith(4242);
+	});
+
+	it("a send to a dead-resolved target never reaches the wire and does not invalidate", async () => {
+		const transport = makeTransport();
+		const invalidateAlive = vi.fn();
+		const deadEntry = entry({}, false);
+		const deps = makeDeps({
+			transport,
+			registry: makeRegistry(() => ({ kind: "unique", entry: deadEntry }), [], invalidateAlive),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		// The resolve ladder rejects dead targets up front with "offline":
+		// no wire write, no liveness verdict to invalidate.
+		await expect(outbox.send("alpha", "hi", {})).rejects.toMatchObject({ code: "offline" });
+		expect(invalidateAlive).not.toHaveBeenCalled();
+		expect(transport.connects).toEqual([]);
 	});
 });
 });

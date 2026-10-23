@@ -908,6 +908,47 @@ describe("alive-cache", () => {
 		expect(probeCount()).toBe(2);
 	});
 
+	it("invalidateAlive drops a warm verdict: the next list() re-probes the pid", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list(); // Warms the alive cache (probe #1).
+		expect(probeCount()).toBe(1);
+		registry.invalidateAlive(LIVE_PID);
+		// Still inside the TTL window: without invalidation this would be 1.
+		registry.list();
+		expect(probeCount()).toBe(2);
+		// The re-probe (a live pid) refreshes the verdict: cached again.
+		registry.list();
+		expect(probeCount()).toBe(2);
+	});
+
+	it("invalidateAlive drops the scan cache so the next list() is a real scan", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		registry.invalidateAlive(LIVE_PID);
+		// A record planted after the cached scan is invisible to a cached
+		// list(); invalidateAlive must force a real scan that sees it.
+		writeFileSync(recordFile(secondLivePid), JSON.stringify(makeRecord(secondLivePid, { name: "bob" })));
+		expect(registry.list()).toHaveLength(2);
+	});
+
+	it("invalidateAlive is a no-op for an uncached pid (no probe side effects)", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.invalidateAlive(LIVE_PID);
+		// No record, no verdict: list() scans an empty dir and probes nothing.
+		expect(registry.list()).toEqual([]);
+		expect(probeCount()).toBe(0);
+	});
+
 	it("prunes verdicts older than 10× the TTL at the start of a real scan", () => {
 		freshRegistry();
 		vi.useFakeTimers();

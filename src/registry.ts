@@ -380,6 +380,18 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 			}
 		}
 	}
+	/**
+	 * Drop a cached "live" verdict for a pid (self-heal after a failed
+	 * connect): a process that just died can sit in the liveness cache for
+	 * up to its TTL, so the verdict must go now — the next list() probes
+	 * for real instead of reporting the dead peer as live. The scan cache
+	 * goes with it (same as publish/update): otherwise the stale listing
+	 * would be served until its own TTL expires.
+	 */
+	function invalidateAlive(pid: number): void {
+		aliveCache.delete(pid);
+		listCache = undefined;
+	}
 
 	function list(opts?: { fresh?: boolean }): PeerRegistryEntry[] {
 		const now = Date.now();
@@ -608,6 +620,7 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		unpublish,
 		list,
 		readRecord,
+		invalidateAlive,
 		resolve,
 		resolveIn,
 		normalizeName,

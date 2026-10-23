@@ -50,6 +50,12 @@ export interface PeerSpawnerDeps {
 	cwd: () => string;
 	/** How long to wait for the child's registry record before giving up. */
 	registerTimeoutMs?: number;
+	/**
+	 * Aborts an in-flight waitForRegistration: the while+sleep poll loop would
+	 * otherwise run to its full timeout on a session that is already dying.
+	 * Optional — callers without a session lifetime pass nothing.
+	 */
+	signal?: AbortSignal;
 	exec?: PeerExec;
 }
 
@@ -133,9 +139,26 @@ function randomSuffix(): string {
 	return Math.random().toString(36).slice(2, 6);
 }
 
-function sleep(ms: number): Promise<void> {
+/**
+ * Abortable sleep: settles immediately when the signal fires (the caller's
+ * next loop-iteration abort check then throws) — otherwise after `ms`.
+ */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
-	setTimeout(resolve, ms);
+	const timer = setTimeout(resolve, ms);
+	const onAbort = () => {
+		clearTimeout(timer);
+		resolve();
+	};
+	// One listener per 300ms step would stack ~100 of them over a 30s wait and
+	// trip Node's MaxListeners warning: always detach on settle. `once` does not
+	// cover the timer expiry path, so detach covers both settle routes.
+	if (signal?.aborted === true) onAbort();
+	else signal?.addEventListener("abort", onAbort, { once: true });
+	promise.then(
+		() => signal?.removeEventListener("abort", onAbort),
+		() => signal?.removeEventListener("abort", onAbort),
+	);
 	return promise;
 }
 
@@ -149,6 +172,11 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 		const env = buildChildEnv(opts, name);
 		const cwd = deps.cwd();
 		const spawnedAt = Date.now();
+		// A session already shutting down must not start a child at all — the
+		// loop's in-flight abort only covers the wait phase.
+		if (deps.signal?.aborted === true) {
+			throw new PeerSpawnError("spawn_failed", "spawn aborted: session is shutting down");
+		}
 
 		let spawnError: Error | undefined;
 		const child = exec(command, args, { cwd, env, headless: opts.headless === true });
@@ -166,6 +194,16 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 		const headless = opts.headless === true;
 		let entry: PeerRegistryEntry | undefined;
 		while (Date.now() < deadline) {
+			// A dying session must not keep polling (nor sleep out the loop's
+			// 300ms steps) up to the full register timeout: abort as soon as
+			// shutdown is signalled. The timeout path below still applies on
+			// its own. Plain member reads (not ?.aborted === true) — TS keeps
+			// `aborted` boolean, so the flag can flip mid-loop without the
+			// pre-spawn narrow-check making this branch look unreachable.
+			if (deps.signal !== undefined && deps.signal.aborted) {
+				if (headless) child.kill();
+				throw new PeerSpawnError("spawn_failed", "spawn aborted: session is shutting down");
+			}
 			if (spawnError !== undefined) {
 				throw new PeerSpawnError("spawn_failed", `failed to launch: ${spawnError.message}`);
 			}
@@ -192,7 +230,7 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 					.find((c) => c.record.name === normalizedName && c.record.startedAt >= graceFloor);
 			}
 			if (entry !== undefined) break;
-			await sleep(300);
+			await sleep(300, deps.signal);
 		}
 		if (entry === undefined) {
 			if (headless) child.kill();
@@ -213,6 +251,10 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 			}
 		}
 
+		// Finding the record (readRecord / fresh list above) does not refresh the
+		// parent's cached /peers listing: without this forced rescan, callers could
+		// miss the new peer for the scan cache's TTL window.
+		deps.registry.list({ fresh: true });
 		return { pid: entry.record.pid, name: entry.record.name, ref: deps.registry.refOf(entry.record), taskSent };
 	};
 }

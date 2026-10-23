@@ -306,6 +306,20 @@ export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 			// wire-cap message_too_large check): a send that never reached the
 			// wire must not leave the caller's bucket one token poorer.
 			pacer.refund(target);
+			// Liveness self-heal: a connect-level failure against a peer we
+			// believed alive means it likely died after its verdict was cached
+			// (the alive cache can hold a stale live:true for up to its TTL).
+			// Drop that verdict so the next resolve/list() re-probes and the
+			// user gets "offline" instead of another connect_failed. Only the
+			// connect-phase codes qualify: message_too_large etc. say nothing
+			// about liveness.
+			if (
+				entry.live &&
+				error instanceof PeerSendError &&
+				(error.code === "connect_failed" || error.code === "timeout")
+			) {
+				registry.invalidateAlive(record.pid);
+			}
 			throw error;
 		}
 		// Registered only after a successful deliver: a receipt for a msg_id

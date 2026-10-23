@@ -228,6 +228,7 @@ function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: Pe
 		normalizeName: (name: string) => name.toLowerCase().replace(/\s+/g, "-"),
 		refOf: (rec: PeerRecord) => `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`,
 		isAlive: () => true,
+		invalidateAlive: () => {},
 		readProcStart: () => undefined,
 		pidDomain: () => "win32:box",
 	};
@@ -1915,6 +1916,60 @@ describe("createPeerInbox", () => {
 		// Only the fresh subscription fires; the 31-minute-old one was evicted.
 		const nonces = outbox.controlCalls.map((c) => (c.frame as PeerIdleNoticeFrame).nonce);
 		expect(nonces).toEqual(["n-fresh"]);
+	});
+
+	it("an expired idleSub is evicted by the onIdle flush itself, no new subscription needed", async () => {
+		// The bug this pins: evictIdleSubs only ran on subscription arrival,
+		// so a long busy stretch with no new subscriptions let TTL-expired
+		// subs linger until the flush — then onIdle notified long-dead peers.
+		const old = `pipe:LOCAL\\pi-peer-${"b".repeat(32)}`;
+		const fresh = `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+		const transport = makeTransport();
+		transport.validAddresses.add(old);
+		transport.validAddresses.add(fresh);
+		const { inbox, outbox } = makeInbox({ transport });
+		await inbox.handleFrame(
+			{
+				msgV: 1,
+				msg_id: "sub-old",
+				type: "control",
+				action: "notify_when_idle",
+				reply_to: old,
+				from: old,
+				nonce: "n-old",
+			},
+			"peer",
+		);
+		// Park the fresh subscription 10 minutes in, so it is 21 min old at
+		// the flush — under the 30-minute TTL.
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + 10 * 60_000);
+		await inbox.handleFrame(
+			{
+				msgV: 1,
+				msg_id: "sub-fresh",
+				type: "control",
+				action: "notify_when_idle",
+				reply_to: fresh,
+				from: fresh,
+				nonce: "n-fresh",
+			},
+			"peer",
+		);
+
+		// 21 more minutes of busy silence: NO new subscription arrives, so
+		// the arrival-time eviction never runs; only the flush can evict.
+		vi.setSystemTime(Date.now() + 21 * 60_000);
+		inbox.onIdle();
+		vi.useRealTimers();
+
+		// Only the fresh subscription is notified; the stale one was dropped
+		// by the flush instead of costing a dead-peer connect.
+		expect(outbox.controlCalls.length).toBe(1);
+		expect(outbox.controlCalls[0]!.address).toBe(fresh);
+		const notice = outbox.controlCalls[0]!.frame as PeerIdleNoticeFrame;
+		expect(notice.action).toBe("peer_idle_notice");
+		expect(notice.nonce).toBe("n-fresh");
 	});
 
 });

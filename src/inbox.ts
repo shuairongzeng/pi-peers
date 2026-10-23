@@ -507,6 +507,12 @@ export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 
 	/** Fire pending subscriptions when the local agent transitions to idle. */
 	function onIdle(): void {
+		// Evict TTL-expired subscriptions before snapshotting/flushing: during
+		// a long busy stretch with no new subscriptions the arrival-time
+		// eviction never runs, and the flush is exactly when staleness would
+		// hurt — notices to long-dead peers are wasted connects. No timer
+		// needed: this flush is the earliest moment the TTL matters.
+		evictIdleSubs();
 		const subs = Array.from(idleSubs.values());
 		idleSubs.clear();
 		queuedCount = 0;
