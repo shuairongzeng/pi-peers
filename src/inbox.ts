@@ -109,8 +109,16 @@ export function createPeerInbox(deps: PeerServiceDeps & { outbox: PeerOutbox }):
 			}
 		}
 		while (idleSubs.size > IDLE_SUB_MAX) {
-			const oldest = [...idleSubs.entries()].reduce((a, b) => (b[1].atMs < a[1].atMs ? b : a));
-			idleSubs.delete(oldest[0]);
+			let oldestKey: string | undefined;
+			let oldestAt = Number.POSITIVE_INFINITY;
+			for (const [key, sub] of idleSubs) {
+				if (sub.atMs < oldestAt) {
+					oldestAt = sub.atMs;
+					oldestKey = key;
+				}
+			}
+			if (oldestKey === undefined) break;
+			idleSubs.delete(oldestKey);
 		}
 	}
 

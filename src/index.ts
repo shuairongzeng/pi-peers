@@ -476,6 +476,9 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		const next = typeof event === "object" && event !== null && "name" in event && typeof event.name === "string" ? event.name : undefined;
 		if (next !== undefined && next !== record.name) {
 			formerNames.push({ name: record.name, until: new Date().toISOString() });
+			// Cap the trail: it is persisted in the record on every publish, so an
+			// unbounded array would bloat the file under scripted renames.
+			if (formerNames.length > 32) formerNames.splice(0, formerNames.length - 32);
 			identity.name = next;
 			registry.update(process.pid, { name: next, nameSource: "user", formerNames: [...formerNames] });
 			record = { ...record, name: next, nameSource: "user", formerNames: [...formerNames] };

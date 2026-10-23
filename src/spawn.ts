@@ -105,7 +105,9 @@ function buildChildEnv(opts: PeerSpawnOptions, name: string): NodeJS.ProcessEnv 
 
 function pickUniqueName(registry: PeerRegistry, requested: string | undefined): string {
 	const base = requested !== undefined && requested.trim() !== "" ? requested.trim() : `worker-${randomSuffix()}`;
-	const taken = new Set(registry.list().map((entry) => entry.record.name));
+	// fresh: two rapid spawns must not both miss the other's brand-new record
+	// through the short-TTL scan cache.
+	const taken = new Set(registry.list({ fresh: true }).map((entry) => entry.record.name));
 	if (!taken.has(base)) return base;
 	for (let i = 2; ; i++) {
 		const candidate = `${base}-${i}`;
@@ -141,26 +143,45 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 		});
 
 		// Wait for the child's plugin to publish its registry record. Match on
-		// the name we assigned plus startedAt ≥ spawn time (stale same-name
-		// records from earlier runs must not count).
+		// the name we assigned plus startedAt ≥ spawn time minus grace (stale
+		// same-name records from earlier runs — or a recycled pid's older
+		// record — must not count).
 		const normalizedName = deps.registry.normalizeName(name);
 		const deadline = spawnedAt + timeoutMs;
+		const graceFloor = spawnedAt - 5_000;
+		const headless = opts.headless === true;
 		let entry: PeerRegistryEntry | undefined;
 		while (Date.now() < deadline) {
 			if (spawnError !== undefined) {
 				throw new PeerSpawnError("spawn_failed", `failed to launch: ${spawnError.message}`);
 			}
-			entry = deps.registry
-				.list()
-				.find(
-					(candidate) =>
-						candidate.record.name === normalizedName && candidate.record.startedAt >= spawnedAt - 5_000,
-				);
+			if (headless && child.pid !== undefined) {
+				// Direct child: poll just its record by pid. O(1) file read — no
+				// directory scan, no self-healing side effects, no scan cache.
+				const candidate = deps.registry.readRecord(child.pid);
+				// A record under a DIFFERENT name means the pid was reused by a
+				// foreign process between spawn and registration: keep waiting
+				// (for the child's own record to replace it) until the deadline.
+				if (
+					candidate !== undefined &&
+					candidate.record.name === normalizedName &&
+					candidate.record.startedAt >= graceFloor
+				) {
+					entry = candidate;
+				}
+			} else {
+				// Visible spawn: `cmd /c start` hides the real host pid behind the
+				// intermediate shell (see defaultExec), so pid polling cannot
+				// work — fall back to name matching over a real (uncached) scan.
+				entry = deps.registry
+					.list({ fresh: true })
+					.find((c) => c.record.name === normalizedName && c.record.startedAt >= graceFloor);
+			}
 			if (entry !== undefined) break;
 			await sleep(300);
 		}
 		if (entry === undefined) {
-			if (opts.headless === true) child.kill();
+			if (headless) child.kill();
 			throw new PeerSpawnError(
 				"register_timeout",
 				`spawned "${name}" but it did not register within ${Math.round(timeoutMs / 1000)}s`,

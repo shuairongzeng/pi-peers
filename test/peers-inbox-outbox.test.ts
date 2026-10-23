@@ -222,6 +222,7 @@ function makeRegistry(resolveImpl: (name: string) => PeerResolution, entries: Pe
 		update: () => {},
 		unpublish: () => {},
 		list: () => entries,
+		readRecord: (pid: number) => entries.find((e) => e.record.pid === pid),
 		resolve: resolveImpl,
 		resolveIn: (name: string, scoped: PeerRegistryEntry[]) => resolveImpl(name),
 		normalizeName: (name: string) => name.toLowerCase().replace(/\s+/g, "-"),

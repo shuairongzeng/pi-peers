@@ -259,6 +259,19 @@ function toResolution(matches: PeerRegistryEntry[]): PeerResolution | undefined 
  * self-healing depends on accurate dead detection, so they re-probe always.
  */
 const ALIVE_CACHE_TTL_MS = 1500;
+/** Verdicts this old are pruned at the start of a real list() scan (pid churn). */
+const ALIVE_CACHE_PRUNE_MS = ALIVE_CACHE_TTL_MS * 10;
+
+/**
+ * TTL for the list() result cache. One user action (send, /peers, resolve,
+ * name disambiguation) triggers several list() calls within a few ms, and
+ * every real scan is a full directory sweep — readdir + per-record
+ * read/parse/probe + key sweep — which a dirty registry turns into hundreds
+ * of blocked event-loop ms. Half a second of staleness is invisible to every
+ * caller: write-side ops invalidate immediately, and the next real scan
+ * re-heals anything the cached window hid.
+ */
+const REGISTRY_LIST_CACHE_MS = 500;
 
 /** Positive-verdict cache entry; `live` is always true (false is never cached). */
 interface AliveCacheEntry {
@@ -269,9 +282,17 @@ interface AliveCacheEntry {
 
 /** Liveness short-TTL cache (positive verdicts only; instance-scoped). */
 type AliveCache = Map<number, AliveCacheEntry>;
+/** Cached list() result; the array is handed out read-only, so one reference serves all callers. */
+interface ListCacheEntry {
+	entries: PeerRegistryEntry[];
+	/** ms epoch of the scan that produced the entries. */
+	at: number;
+}
+
 
 export function createPeerRegistry(peersDir: string): PeerRegistry {
 	const aliveCache: AliveCache = new Map();
+	let listCache: ListCacheEntry | undefined;
 
 	function recordPath(pid: number): string {
 		return join(peersDir, `${pid}.json`);
@@ -286,6 +307,8 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 	function publish(record: PeerRecord): void {
 		mkdirSync(peersDir, { recursive: true, mode: 0o700 });
 		atomicWriteFileSync(recordPath(record.pid), JSON.stringify(record));
+		// Our own writes must be visible to the very next list(): drop the scan cache.
+		listCache = undefined;
 	}
 
 	function update(pid: number, patch: Partial<PeerRecord>): void {
@@ -307,10 +330,13 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		}
 		const merged = { ...(current as object), ...patch, pid } as PeerRecord;
 		atomicWriteFileSync(path, JSON.stringify(merged));
+		// The patched record must be visible to the very next list(): drop the scan cache.
+		listCache = undefined;
 	}
 
 	function unpublish(pid: number): void {
 		aliveCache.delete(pid); // Our own exit must be reflected on the very next list().
+		listCache = undefined; // …and the scan cache with it.
 		silentUnlink(recordPath(pid));
 		for (const name of readDirNames(peersDir)) {
 			const key = PEER_KEY_FILE_RE.exec(name);
@@ -320,11 +346,83 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		}
 	}
 
-	function list(): PeerRegistryEntry[] {
-		const entries: PeerRegistryEntry[] = [];
+	function list(opts?: { fresh?: boolean }): PeerRegistryEntry[] {
 		const now = Date.now();
-		// Full-directory reads (and the self-healing they drive) still run on every list();
-		// only the per-pid probe syscalls are cached.
+		// Short-TTL result cache: one user action (send, /peers, resolve, name
+		// disambiguation) triggers several list() calls in a few ms; a full scan
+		// is readdir + one read/parse per record + probe + key sweep, which a
+		// dirty registry turns into hundreds of blocked-ms on the event loop.
+		// Callers treat the array as read-only, so the same reference is safe.
+		// Stale reads self-correct: write-side ops invalidate, the TTL expires,
+		// and any record the cache hides appears on the next real scan.
+		if (opts?.fresh !== true && listCache !== undefined && now - listCache.at < REGISTRY_LIST_CACHE_MS) {
+			return listCache.entries;
+		}
+		const entries = scanRegistry(now);
+		listCache = { entries, at: now };
+		return entries;
+	}
+
+	/**
+	 * Read exactly one record by pid: direct file read, no directory scan, no
+	 * sweeping, no scan-cache. Returns the entry with a real liveness verdict
+	 * (aliveCache semantics identical to list()), or undefined when the record
+	 * is missing or malformed. For hot polling loops that watch a known pid.
+	 */
+	function readRecord(pid: number): PeerRegistryEntry | undefined {
+		const path = recordPath(pid);
+		let raw: string;
+		try {
+			raw = readFileSync(path, "utf8");
+		} catch {
+			return undefined; // Not published (or unreadable): no record for this pid.
+		}
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			return undefined; // Malformed JSON: leave the file for list() to clean up.
+		}
+		const record = parsePeerRecord(parsed);
+		if (record === undefined || record.pid !== pid) {
+			// Malformed, or pid/name mismatch (torn write): not a readable record.
+			return undefined;
+		}
+		return { record, live: liveVerdictFor(record, Date.now()) };
+	}
+
+	/**
+	 * Liveness verdict with list()'s aliveCache semantics: a fresh positive
+	 * verdict is trusted (probe syscalls skipped), a new positive verdict is
+	 * cached. Negative verdicts are never cached — self-healing needs them
+	 * accurate on every scan. `now` comes from the caller so one scan sees one
+	 * coherent time (readRecord has no scan clock, so it reads the clock itself).
+	 */
+	function liveVerdictFor(record: PeerRecord, now: number): boolean {
+		const cached = aliveCache.get(record.pid);
+		// Fresh positive verdict: trust it and skip the per-pid probe syscalls.
+		const fresh = cached !== undefined && now - cached.at < ALIVE_CACHE_TTL_MS;
+		const live = fresh ? cached.live : isAlive(record);
+		if (live && !fresh) {
+			aliveCache.set(record.pid, { live: true, at: now });
+		}
+		return live;
+	}
+
+	/** Full directory scan: parse every record, self-heal, sweep orphan keys. */
+	function scanRegistry(now: number): PeerRegistryEntry[] {
+		const entries: PeerRegistryEntry[] = [];
+		// Prune ancient verdicts before scanning: entries are otherwise only
+		// deleted when a dead record is seen again, so pid churn (spawned
+		// helpers, recycled OS pids) would grow the map without bound.
+		// 10× the verdict TTL: anything older was re-probed long ago anyway.
+		for (const [pid, verdict] of aliveCache) {
+			if (now - verdict.at >= ALIVE_CACHE_PRUNE_MS) {
+				aliveCache.delete(pid);
+			}
+		}
+		// Full-directory reads (and the self-healing they drive) still run on
+		// every real scan; only the per-pid probe syscalls are cached.
 		for (const name of readDirNames(peersDir)) {
 			const match = PEER_RECORD_FILE_RE.exec(name);
 			if (!match) {
@@ -348,13 +446,7 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 				silentUnlink(path); // Torn write (name/content pid mismatch): self-heal.
 				continue;
 			}
-			const cached = aliveCache.get(record.pid);
-			// Fresh positive verdict: trust it and skip the per-pid probe syscalls.
-			const fresh = cached !== undefined && now - cached.at < ALIVE_CACHE_TTL_MS;
-			const live = fresh ? cached.live : isAlive(record);
-			if (live && !fresh) {
-				aliveCache.set(record.pid, { live: true, at: now });
-			}
+			const live = liveVerdictFor(record, now);
 			if (!live) {
 				// Stale record (process gone / pid reused): report once with live=false, then self-heal.
 				aliveCache.delete(record.pid); // Defensive: bury any verdict along with the record.
@@ -463,6 +555,7 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 		update,
 		unpublish,
 		list,
+		readRecord,
 		resolve,
 		resolveIn,
 		normalizeName,

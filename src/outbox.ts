@@ -189,7 +189,7 @@ export function createPeerOutbox(deps: PeerServiceDeps & { peersDir: string }): 
 			);
 		}
 
-		const key = auth.lookupKey(deps.peersDir, record.socketPath);
+		const key = auth.lookupKey(deps.peersDir, record.socketPath, record.pid);
 		if (key === undefined) {
 			throw new PeerSendError(
 				"no_key",

@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { connect as netConnect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createPeerAuth } from "../src/auth.ts";
+import { createPeerAuth, lookupKeyForPid } from "../src/auth.ts";
 import {
 	addressFromPath,
 	createPeerTransport,
@@ -564,6 +564,95 @@ describe("peer auth key files", () => {
 		const files = readdirSync(peersDir);
 		expect(files).toHaveLength(1);
 		expect(files[0].endsWith(".key")).toBe(true);
+	});
+
+	it("looks up a key via the direct path when a pid hint hits", () => {
+		const canonical = `\\\\.\\pipe\\LOCAL\\${pipeName()}`;
+		const tokens = auth.generateTokens();
+		auth.publishKey(peersDir, 700, canonical, tokens, "ps-700", "d");
+
+		// A second key from an unrelated pid with a different path hash: a
+		// scan would have to filter it out; the hint must skip past it.
+		auth.publishKey(peersDir, 800, `\\\\.\\pipe\\LOCAL\\${pipeName()}`, auth.generateTokens(), undefined, "d");
+		expect(readdirSync(peersDir)).toHaveLength(2);
+
+		expect(lookupKeyForPid(peersDir, canonical, 700)).toEqual({
+			pid: 700,
+			peerToken: tokens.peerToken,
+			procStart: "ps-700",
+			pidDomain: "d",
+		});
+		// The hinted form agrees with the scan-only form.
+		expect(lookupKeyForPid(peersDir, canonical, 700)).toEqual(auth.lookupKey(peersDir, canonical));
+	});
+
+	it("falls back to the scan when the pid hint is stale", () => {
+		const canonical = `\\\\.\\pipe\\LOCAL\\${pipeName()}`;
+		const tokens = auth.generateTokens();
+		auth.publishKey(peersDir, 900, canonical, tokens, "ps-900", "d");
+
+		// Hint points at a pid that never published for this path (pid reuse).
+		expect(lookupKeyForPid(peersDir, canonical, 12345)).toEqual({
+			pid: 900,
+			peerToken: tokens.peerToken,
+			procStart: "ps-900",
+			pidDomain: "d",
+		});
+
+		// A hinted miss with no key anywhere is still undefined.
+		expect(lookupKeyForPid(peersDir, `\\\\.\\pipe\\LOCAL\\${pipeName()}`, 900)).toBeUndefined();
+	});
+
+	it("falls back to the scan when the hinted file is malformed", () => {
+		const canonical = `\\\\.\\pipe\\LOCAL\\${pipeName()}`;
+		const tokens = auth.generateTokens();
+		auth.publishKey(peersDir, 950, canonical, tokens, "ps-950", "d");
+		const keyFile = readdirSync(peersDir).find((f) => f.startsWith("950."));
+		// Tampered payload at the exact hinted filename must not win.
+		writeFileSync(join(peersDir, keyFile!), "not-json");
+
+		expect(lookupKeyForPid(peersDir, canonical, 950)).toBeUndefined();
+	});
+
+	it("finds the key exactly as before when no hint is given", () => {
+		const canonical = `\\\\.\\pipe\\LOCAL\\${pipeName()}`;
+		const tokens = auth.generateTokens();
+		auth.publishKey(peersDir, 1000, canonical, tokens, undefined, "d");
+
+		expect(auth.lookupKey(peersDir, canonical)).toEqual({ pid: 1000, peerToken: tokens.peerToken, pidDomain: "d" });
+		expect(auth.lookupKey(peersDir, `\\\\.\\pipe\\LOCAL\\${pipeName()}`)).toBeUndefined();
+	});
+
+	it("replaces the key file in place when a (pid, path) re-publishes", () => {
+		const canonical = `\\\\.\\pipe\\LOCAL\\${pipeName()}`;
+		const first = auth.generateTokens();
+		auth.publishKey(peersDir, 1100, canonical, first, "ps-1", "d");
+		const original = readdirSync(peersDir);
+		expect(original).toHaveLength(1);
+		const keyFile = original[0];
+
+		// Rotation: same (pid, path) → same filename, atomic rename over the
+		// old file. Backdating the original mtime (publishKey sets it "now",
+		// and the re-publish follows immediately, so an un-manipulated clock
+		// could tie) makes the bump deterministic proof of in-place overwrite.
+		const keyPath = join(peersDir, keyFile);
+		utimesSync(keyPath, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000));
+		const stale = statSync(keyPath);
+		const second = auth.generateTokens();
+		auth.publishKey(peersDir, 1100, canonical, second, "ps-2", "d");
+		expect(statSync(keyPath).mtimeMs).toBeGreaterThan(stale.mtimeMs);
+		const after = readdirSync(peersDir);
+		expect(after).toEqual([keyFile]);
+
+		// Second publication wins for both lookup forms; the first is gone.
+		expect(lookupKeyForPid(peersDir, canonical, 1100)).toEqual({
+			pid: 1100,
+			peerToken: second.peerToken,
+			procStart: "ps-2",
+			pidDomain: "d",
+		});
+		expect(auth.lookupKey(peersDir, canonical)?.peerToken).toBe(second.peerToken);
+		expect(second.peerToken).not.toBe(first.peerToken);
 	});
 });
 

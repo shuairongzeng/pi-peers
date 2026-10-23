@@ -85,12 +85,29 @@ export function publishKey(
  * may have re-published under a different number while the path's key still
  * belongs to the live listener. Malformed payloads return undefined rather
  * than throwing — callers treat that as "cannot authenticate".
+ *
+ * When pidHint is given, the deterministic filename is probed first — one
+ * readFileSync instead of a directory scan on the hot send path. Any miss
+ * (ENOENT, malformed payload, pid mismatch) falls back to the full scan, so
+ * a stale hint can never break a lookup the scan would have found.
  */
 export function lookupKey(
 	peersDir: string,
 	canonicalSocketPath: string,
+	pidHint?: number,
 ): { pid: number; peerToken: string; procStart?: string; pidDomain?: string } | undefined {
 	const hash = hashSocketPath(canonicalSocketPath);
+
+	if (pidHint !== undefined) {
+		try {
+			const direct = parseKeyFile(readFileSync(join(peersDir, `${pidHint}.${hash}.key`), "utf8"), pidHint);
+			if (direct !== undefined) {
+				return direct;
+			}
+		} catch {
+			// Absent/unreadable (typical for a stale pid hint): fall back to the scan.
+		}
+	}
 
 	let entries: string[];
 	try {
@@ -108,37 +125,54 @@ export function lookupKey(
 		try {
 			raw = readFileSync(join(peersDir, entry), "utf8");
 		} catch {
+			// Raced-away file: try the next candidate.
 			continue;
 		}
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(raw);
-		} catch {
-			continue;
+		const candidate = parseKeyFile(raw, Number(match[1]));
+		if (candidate !== undefined) {
+			return candidate;
 		}
-		if (typeof parsed !== "object" || parsed === null) {
-			continue;
-		}
-		const key = parsed as Record<string, unknown>;
-		if (
-			typeof key.pid !== "number" ||
-			!Number.isInteger(key.pid) ||
-			key.pid !== Number(match[1]) ||
-			typeof key.peerToken !== "string" ||
-			!TOKEN_RE.test(key.peerToken)
-		) {
-			continue;
-		}
-		const result: PeerKeyFile = { pid: key.pid, peerToken: key.peerToken };
-		if (typeof key.procStart === "string") {
-			result.procStart = key.procStart;
-		}
-		if (typeof key.pidDomain === "string") {
-			result.pidDomain = key.pidDomain;
-		}
-		return result;
 	}
 	return undefined;
+}
+
+/**
+ * Parse and validate one key file payload against the pid encoded in its
+ * filename. Malformed or tampered content yields undefined, which callers
+ * treat as "no key" (fast path: fall back to the scan; scan: keep looking).
+ */
+function parseKeyFile(
+	raw: string,
+	expectedPid: number,
+): { pid: number; peerToken: string; procStart?: string; pidDomain?: string } | undefined {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		// Unparseable payload is corrupt/tampered: report "no key", never throw.
+		return undefined;
+	}
+	if (typeof parsed !== "object" || parsed === null) {
+		return undefined;
+	}
+	const key = parsed as Record<string, unknown>;
+	if (
+		typeof key.pid !== "number" ||
+		!Number.isInteger(key.pid) ||
+		key.pid !== expectedPid ||
+		typeof key.peerToken !== "string" ||
+		!TOKEN_RE.test(key.peerToken)
+	) {
+		return undefined;
+	}
+	const result: PeerKeyFile = { pid: key.pid, peerToken: key.peerToken };
+	if (typeof key.procStart === "string") {
+		result.procStart = key.procStart;
+	}
+	if (typeof key.pidDomain === "string") {
+		result.pidDomain = key.pidDomain;
+	}
+	return result;
 }
 
 /** Remove every key file belonging to this pid (shutdown path). */
@@ -170,4 +204,20 @@ export function createPeerAuth(): PeerAuth {
 		lookupKey,
 		deleteKeys,
 	};
+}
+
+/**
+ * pid-hinted fast path over lookupKey. The PeerAuth interface (frozen in
+ * types.ts) types lookupKey without the hint, and the interface type erases
+ * the implementation's extra parameter at every interface-typed call site —
+ * so the hint-accepting form is exposed under its own name for senders that
+ * hold a live pid. Semantics are lookupKey's: hint miss (stale pid, malformed
+ * direct file) falls back to the full scan.
+ */
+export function lookupKeyForPid(
+	peersDir: string,
+	socketPath: string,
+	pid: number,
+): { pid: number; peerToken: string; procStart?: string; pidDomain?: string } | undefined {
+	return lookupKey(peersDir, socketPath, pid);
 }

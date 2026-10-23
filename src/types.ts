@@ -464,6 +464,8 @@ export interface PeerAuth {
 	lookupKey(
 		peersDir: string,
 		canonicalSocketPath: string,
+		/** Live-pid hint: enables the O(1) direct-filename read; misses fall back to the directory scan. */
+		pidHint?: number,
 	): { pid: number; peerToken: string; procStart?: string; pidDomain?: string } | undefined;
 	/** Best-effort removal of this instance's key files. */
 	deleteKeys(peersDir: string, pid: number): void;
@@ -531,8 +533,21 @@ export interface PeerRegistry {
 	update(pid: number, patch: Partial<PeerRecord>): void;
 	/** Remove our record and stale key files. */
 	unpublish(pid: number): void;
-	/** Scan the registry dir; deletes malformed/dead records (self-healing). */
-	list(): PeerRegistryEntry[];
+	/**
+	 * Scan the registry dir; deletes malformed/dead records (self-healing).
+	 * Results are cached for a few hundred ms and reused across callers within
+	 * the same operation window; `publish`/`update`/`unpublish` invalidate it.
+	 * Pass `{ fresh: true }` to force a real scan (e.g. when watching for a
+	 * record that may have just appeared).
+	 */
+	list(opts?: { fresh?: boolean }): PeerRegistryEntry[];
+	/**
+	 * Read exactly one record by pid (direct file read, no directory scan).
+	 * Returns the entry with a real liveness verdict, or undefined when the
+	 * record is missing/malformed. No sweeping, no caching — for hot polling
+	 * loops that watch a known pid.
+	 */
+	readRecord(pid: number): PeerRegistryEntry | undefined;
 	/** Resolve a user/agent-supplied name ("name", "name [ref]", or exact sessionId) to one live peer. */
 	resolve(name: string): PeerResolution;
 	/** Like resolve(), but matches only within the given candidate list (e.g. project-scoped). */

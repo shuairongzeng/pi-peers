@@ -450,16 +450,16 @@ describe("peers plugin wiring (dual-host)", () => {
 		const { pi, handlers, commands } = createFakePi();
 		peersExtension(pi);
 
-		const ctx = createFakeCtx(peersDir);
-		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
-
 		// Two real live child processes: one in another project, one in ours.
 		// (Liveness is a real kill(pid, 0) probe — records must point at
 		// processes that actually exist, so plant records under their pids.)
+		// Planted BEFORE session_start: raw file writes bypass publish() and its
+		// cache invalidation, so they must predate the startup scan to be seen.
 		const other = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000);"], { stdio: "ignore", windowsHide: true });
 		const same = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000);"], { stdio: "ignore", windowsHide: true });
 		const otherPid = other.pid as number;
 		const samePid = same.pid as number;
+		const ctx = createFakeCtx(peersDir);
 		try {
 			const exitPromises = [other, same].map((child) => {
 				const { promise, resolve } = Promise.withResolvers<void>();
@@ -482,6 +482,8 @@ describe("peers plugin wiring (dual-host)", () => {
 				const hash = createHash("sha256").update(rec.socketPath).digest("hex");
 				writeFileSync(join(peersDir, `${pid}.${hash}.key`), "{}");
 			}
+
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
 
 			const messages: string[] = [];
 			const notifyCtx = createFakeCtx(peersDir, {

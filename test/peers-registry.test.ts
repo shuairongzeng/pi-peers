@@ -91,6 +91,24 @@ function visibleFileNames(): string[] {
 	return readdirSync(peersDir).sort();
 }
 
+/**
+ * Count real probes for one pid without changing their verdicts: isAlive()
+ * probes via process.kill(pid, 0), so wrapping the original (bound before
+ * the spy — calling process.kill inside would recurse into the mock) keeps
+ * real liveness semantics while making the probe count observable.
+ */
+function probeCountFor(pid: number): () => number {
+	const probed: number[] = [];
+	const realKill = process.kill.bind(process);
+	vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: number | string) => {
+		if (target === pid) {
+			probed.push(target);
+		}
+		return realKill(target, signal);
+	}) as typeof process.kill);
+	return () => probed.length;
+}
+
 describe("publish/list round trip", () => {
 	it("publishes a record and lists it as live", () => {
 		freshRegistry();
@@ -176,6 +194,62 @@ describe("unpublish", () => {
 	});
 });
 
+describe("readRecord", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it("returns a live entry for a published record", () => {
+		freshRegistry();
+		const record = makeRecord(LIVE_PID, { name: "alice" });
+		registry.publish(record);
+		const entry = registry.readRecord(LIVE_PID);
+		expect(entry).toMatchObject({ live: true, record });
+	});
+
+	it("returns undefined for a pid with no record file", () => {
+		freshRegistry();
+		expect(registry.readRecord(DEAD_PID)).toBeUndefined();
+	});
+
+	it("returns undefined for malformed JSON", () => {
+		freshRegistry();
+		writeFileSync(recordFile(LIVE_PID), "{ not json");
+		expect(registry.readRecord(LIVE_PID)).toBeUndefined();
+		// No sweeping on the read path: the file stays for list() to heal.
+		expect(existsSync(recordFile(LIVE_PID))).toBe(true);
+	});
+
+	it("returns undefined for a record whose pid mismatches the file name", () => {
+		freshRegistry();
+		writeFileSync(recordFile(12345), JSON.stringify(makeRecord(LIVE_PID)));
+		expect(registry.readRecord(12345)).toBeUndefined();
+	});
+
+	it("returns a dead entry for a dead pid", () => {
+		freshRegistry();
+		writeFileSync(recordFile(DEAD_PID), JSON.stringify(makeRecord(DEAD_PID, { name: "ghost" })));
+		const entry = registry.readRecord(DEAD_PID);
+		expect(entry).toMatchObject({ live: false, record: { name: "ghost" } });
+	});
+
+	it("uses the aliveCache: a pid probed once is not re-probed within the TTL", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list(); // Fills the alive cache (scans probe live pids).
+		expect(probeCount()).toBe(1);
+		expect(registry.readRecord(LIVE_PID)?.live).toBe(true);
+		expect(probeCount()).toBe(1); // Same verdict window: no new probe.
+		vi.advanceTimersByTime(1_500);
+		expect(registry.readRecord(LIVE_PID)?.live).toBe(true);
+		expect(probeCount()).toBe(2); // TTL expired: re-probed.
+	});
+});
+
 describe("list self-healing", () => {
 	it("deletes malformed JSON records", () => {
 		freshRegistry();
@@ -253,7 +327,9 @@ describe("list self-healing", () => {
 		];
 		for (const bad of malformed) {
 			writeFileSync(recordFile(DEAD_PID), JSON.stringify(bad));
-			registry.list();
+			// Direct write bypasses publish(): ask for a real scan so this test
+			// asserts per-file self-healing, not scan-cache behavior.
+			registry.list({ fresh: true });
 			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(bad)}`).toBe(false);
 		}
 	});
@@ -262,8 +338,8 @@ describe("list self-healing", () => {
 		freshRegistry();
 		for (const patch of [{ kind: "daemon" }, { status: "sleeping" }, { nameSource: "auto" }]) {
 			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
-			registry.list();
-			expect(existsSync(recordFile(DEAD_PID))).toBe(false);
+			registry.list({ fresh: true });
+			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
 		}
 	});
 
@@ -284,8 +360,9 @@ describe("list self-healing", () => {
 		expect(entries[0].live).toBe(false);
 		expect(entries[0].record.name).toBe("ghost");
 		expect(existsSync(recordFile(DEAD_PID))).toBe(false);
-		// The self-healed file is gone: a second scan sees nothing.
-		expect(registry.list()).toEqual([]);
+		// The self-healed file is gone: a second REAL scan sees nothing (the
+		// first scan's result would sit in the 500ms list cache).
+		expect(registry.list({ fresh: true })).toEqual([]);
 	});
 
 	it("keeps a leftover temp file out of the listing", () => {
@@ -293,6 +370,92 @@ describe("list self-healing", () => {
 		writeFileSync(join(peersDir, `.${DEAD_PID}.json.tmp-abc123`), "{ partial");
 		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
 		expect(registry.list()).toHaveLength(1);
+	});
+});
+
+describe("list scan cache", () => {
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	it("returns the cached result within the TTL: a record written directly to the dir is hidden", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const a = makeRecord(LIVE_PID, { name: "alice" });
+		registry.publish(a);
+		expect(registry.list()).toHaveLength(1);
+		// Direct write bypasses publish() — no invalidation, no TTL expiry.
+		const b = makeRecord(secondLivePid, { name: "bob" });
+		writeFileSync(recordFile(secondLivePid), JSON.stringify(b));
+		const cached = registry.list();
+		expect(cached).toHaveLength(1);
+		expect(cached[0].record.name).toBe("alice");
+		// The cache also skips sweeping: the unhealed file is still on disk.
+		expect(existsSync(recordFile(secondLivePid))).toBe(true);
+	});
+
+	it("bypasses with { fresh: true } and re-fills the cache", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		writeFileSync(recordFile(secondLivePid), JSON.stringify(makeRecord(secondLivePid, { name: "bob" })));
+		expect(registry.list({ fresh: true })).toHaveLength(2);
+		// The fresh scan refilled the cache: bob persists in the next cached read.
+		expect(registry.list()).toHaveLength(2);
+	});
+
+	it("expires after the TTL: a later list() sees the record the cache hid", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		writeFileSync(recordFile(secondLivePid), JSON.stringify(makeRecord(secondLivePid, { name: "bob" })));
+		vi.advanceTimersByTime(500); // At the TTL boundary: verdict stale.
+		expect(registry.list()).toHaveLength(2);
+	});
+
+	it("publish invalidates the cache", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		registry.publish(makeRecord(secondLivePid, { name: "bob" }));
+		// No { fresh: true }: the plain list() must see the new record.
+		expect(registry.list()).toHaveLength(2);
+	});
+
+	it("update invalidates the cache", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice", status: "idle" }));
+		expect(registry.list()[0].record.status).toBe("idle");
+		registry.update(LIVE_PID, { status: "busy" });
+		expect(registry.list()[0].record.status).toBe("busy");
+	});
+
+	it("unpublish invalidates the cache", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toHaveLength(1);
+		registry.unpublish(LIVE_PID);
+		expect(registry.list()).toEqual([]);
+	});
+
+	it("hands out the same array reference within the TTL", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		expect(registry.list()).toBe(registry.list());
 	});
 });
 
@@ -590,24 +753,6 @@ describe("alive-cache", () => {
 		vi.restoreAllMocks();
 	});
 
-	/**
-	 * Count real probes for one pid without changing their verdicts: isAlive()
-	 * probes via process.kill(pid, 0), so wrapping the original (bound before
-	 * the spy — calling process.kill inside would recurse into the mock) keeps
-	 * real liveness semantics while making the probe count observable.
-	 */
-	function probeCountFor(pid: number): () => number {
-		const probed: number[] = [];
-		const realKill = process.kill.bind(process);
-		vi.spyOn(process, "kill").mockImplementation(((target: number, signal?: number | string) => {
-			if (target === pid) {
-				probed.push(target);
-			}
-			return realKill(target, signal);
-		}) as typeof process.kill);
-		return () => probed.length;
-	}
-
 	it("probes a live pid once when two list() calls fall in the same TTL window", () => {
 		freshRegistry();
 		vi.useFakeTimers();
@@ -661,6 +806,40 @@ describe("alive-cache", () => {
 		// Fresh publish right after suicide: the old cached verdict must not apply.
 		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
 		registry.list();
+		expect(probeCount()).toBe(2);
+	});
+
+	it("prunes verdicts older than 10× the TTL at the start of a real scan", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list(); // Fills the alive cache for LIVE_PID at t=10_000.
+		expect(probeCount()).toBe(1);
+		// Advance 16s: 15s (10× TTL) has passed, so the next real scan must
+		// drop the ancient verdict and re-probe the pid from scratch.
+		vi.advanceTimersByTime(16_000);
+		expect(registry.list({ fresh: true })).toHaveLength(1);
+		expect(probeCount()).toBe(2); // Pruned: probed again instead of trusted.
+	});
+
+	it("keeps verdicts younger than the prune horizon", () => {
+		freshRegistry();
+		vi.useFakeTimers();
+		vi.setSystemTime(10_000);
+		const probeCount = probeCountFor(LIVE_PID);
+		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
+		registry.list();
+		expect(probeCount()).toBe(1);
+		// 2s: past the 1.5s verdict TTL (so the verdict is stale) but far
+		// below the 15s prune horizon — the map keeps the entry (growth is
+		// bounded by the horizon, not the TTL).
+		vi.advanceTimersByTime(2_000);
+		expect(registry.list({ fresh: true })).toHaveLength(1);
+		expect(probeCount()).toBe(2); // Stale verdict re-probed… but not pruned.
+		// Back inside the TTL: the re-probe's fresh verdict is reused.
+		expect(registry.list({ fresh: true })).toHaveLength(1);
 		expect(probeCount()).toBe(2);
 	});
 

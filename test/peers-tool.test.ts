@@ -57,6 +57,7 @@ function makeRegistry(entries: PeerRecord[]): PeerRegistry {
 		update: () => {},
 		unpublish: () => {},
 		list: () => list,
+		readRecord: (pid: number) => list.find((e) => e.record.pid === pid),
 		resolve: (name: string) => resolveInImpl(name, list),
 		resolveIn: (name: string, scoped: PeerRegistryEntry[]) => resolveInImpl(name, scoped),
 		refOf: (rec: PeerRecord) => `${(rec.pid % 256).toString(16).padStart(2, "0")}a1b2c`,

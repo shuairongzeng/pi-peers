@@ -25,7 +25,7 @@ afterEach(() => {
 	rmSync(peersDir, { recursive: true, force: true });
 });
 
-function fakeRecord(name: string, pid: number): PeerRecord {
+function fakeRecord(name: string, pid: number, overrides?: Partial<PeerRecord>): PeerRecord {
 	return {
 		version: 1,
 		pid,
@@ -43,15 +43,15 @@ function fakeRecord(name: string, pid: number): PeerRecord {
 		socketPath: "\\\\.\\pipe\\LOCAL\\nonexistent",
 		peerProtocol: 1,
 		features: [],
+		...overrides,
 	};
 }
 
 /** list() sweeps live-pid records without an auth key: fixtures plant one. */
-function plantRecordWithKey(name: string, pid: number): void {
-	const record = fakeRecord(name, pid);
+function plantRecordWithKey(record: PeerRecord): void {
 	const hash = createHash("sha256").update(record.socketPath).digest("hex");
-	writeFileSync(join(peersDir, `${pid}.${hash}.key`), "{}");
-	writeFileSync(join(peersDir, `${pid}.json`), JSON.stringify(record));
+	writeFileSync(join(peersDir, `${record.pid}.${hash}.key`), "{}");
+	writeFileSync(join(peersDir, `${record.pid}.json`), JSON.stringify(record));
 }
 
 interface FakeProc extends SpawnedProcess {
@@ -64,7 +64,7 @@ function fakeExec(captured: { env?: NodeJS.ProcessEnv; headless?: boolean }): Pe
 	return (_command, _args, options) => {
 		captured.env = options.env;
 		captured.headless = options.headless;
-		plantRecordWithKey(options.env[ENV_PEERS_NAME] ?? "unset", process.pid);
+		plantRecordWithKey(fakeRecord(options.env[ENV_PEERS_NAME] ?? "unset", process.pid));
 		return { pid: process.pid, kill: () => {}, onError: () => {} };
 	};
 }
@@ -119,7 +119,7 @@ describe("createPeerSpawner", () => {
 		});
 		try {
 			const registry = createPeerRegistry(peersDir);
-			plantRecordWithKey("researcher", keeper.pid!);
+			plantRecordWithKey(fakeRecord("researcher", keeper.pid!));
 			const captured: { env?: NodeJS.ProcessEnv } = {};
 			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: fakeExec(captured) });
 			const outcome = await spawner({});
@@ -200,6 +200,48 @@ describe("createPeerSpawner", () => {
 		await expect(spawner({ name: "ghost" })).rejects.toMatchObject({ kind: "register_timeout" });
 	});
 
+	it("headless: ignores a stale same-name record for the child pid", async () => {
+		// A recycled pid's older record: same assigned name, startedAt 10s before
+		// the spawn call — outside the 5s grace window, must not be matched. Planted
+		// inside exec (AFTER name assignment) so the requested name survives
+		// pickUniqueName and the only difference from a fresh record is startedAt.
+		const staleExec: PeerExec = (_command, _args, options) => {
+			plantRecordWithKey(
+				fakeRecord(options.env[ENV_PEERS_NAME] ?? "unset", process.pid, { startedAt: Date.now() - 10_000 }),
+			);
+			return { pid: process.pid, kill: () => {}, onError: () => {} };
+		};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec: staleExec,
+		});
+		await expect(spawner({ name: "stale-worker", headless: true })).rejects.toMatchObject({
+			kind: "register_timeout",
+		});
+	});
+
+	it("headless: ignores a pid-reused record publishing a foreign name", async () => {
+		// The child pid already has a LIVE record — but under a name we did not
+		// assign (foreign process grabbed the recycled pid): keep waiting, do
+		// not adopt it, and time out.
+		plantRecordWithKey(fakeRecord("foreign-owner", process.pid));
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec: () => ({ pid: process.pid, kill: () => {}, onError: () => {} }),
+		});
+		await expect(spawner({ name: "ghost", headless: true })).rejects.toMatchObject({
+			kind: "register_timeout",
+		});
+	});
+
 	it("real process: a node stub registers and is discovered", async () => {
 		// The stub writes its own registry record (its real pid) then stays alive.
 		const stub = `
@@ -233,7 +275,7 @@ describe("createPeerSpawner", () => {
 		const registry = createPeerRegistry(peersDir);
 		const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec: realExec });
 		try {
-			const outcome = await spawner({ name: "stub-worker" });
+			const outcome = await spawner({ name: "stub-worker", headless: true });
 			expect(outcome.name).toBe("stub-worker");
 			expect(outcome.pid).toBe(child?.pid);
 		} finally {
