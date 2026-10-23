@@ -286,7 +286,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		if (ctx === undefined) return;
 		// Spawner-assigned name (PI_PEERS_NAME) wins over a user/derived name:
 		// it is the rendezvous key the spawning session waits for.
-		const envName = process.env[ENV_PEERS_NAME]?.trim();
+		const envNameRaw = process.env[ENV_PEERS_NAME]?.trim();
+		// An all-whitespace/empty override is treated as absent — an empty name
+		// would make parsePeerRecord reject (and sweep) our own record.
+		const envName = envNameRaw === "" ? undefined : envNameRaw;
 		const sessionName = ctx.sessionManager.getSessionName();
 		identity.sessionId = ctx.sessionManager.getSessionId();
 		const derivedName = `${basename(ctx.cwd) || "pi"}-${process.pid}`;
@@ -457,7 +460,10 @@ export default function peersExtension(pi: PeersHostAPI): void {
 	pi.on("session_info_changed", (event: unknown, eventCtx) => {
 		ctx = eventCtx;
 		if (record === undefined) return;
-		const next = typeof event === "object" && event !== null && "name" in event && typeof event.name === "string" ? event.name : undefined;
+		const raw = typeof event === "object" && event !== null && "name" in event && typeof event.name === "string" ? event.name : undefined;
+		// Records must carry a normalized name (parsePeerRecord rejects
+		// non-normalized names and would sweep ours) — normalize before publish.
+		const next = raw === undefined ? undefined : registry.normalizeName(raw) || undefined;
 		if (next !== undefined && next !== record.name) {
 			formerNames.push({ name: record.name, until: new Date().toISOString() });
 			// Cap the trail: it is persisted in the record on every publish, so an

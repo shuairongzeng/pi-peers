@@ -537,6 +537,21 @@ describe("peers plugin wiring (dual-host)", () => {
 		}
 	});
 
+	it("whitespace-only PI_PEERS_NAME falls back to the derived name", async () => {
+		process.env.PI_PEERS_NAME = "   ";
+		try {
+			const { pi, handlers } = createFakePi();
+			peersExtension(pi);
+			await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, createFakeCtx(peersDir));
+			const record = readOwnRecord();
+			expect(typeof record.name).toBe("string");
+			expect(String(record.name).length).toBeGreaterThan(0);
+			expect(record.nameSource).toBe("derived");
+		} finally {
+			delete process.env.PI_PEERS_NAME;
+		}
+	});
+
 	it("ephemeral instances quit on the first idle after work, never before", async () => {
 		process.env.PI_PEERS_EPHEMERAL = "1";
 		let quitCalls = 0;

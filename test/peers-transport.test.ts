@@ -452,6 +452,60 @@ describe("transport round trip", () => {
 		expect(echoed).toEqual(["aa", "bb"]);
 	});
 
+	it("destroys the connection when more than 1000 completed lines queue unconsumed", async () => {
+		const consoleWarn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		try {
+			// onConnection records but never drains `lines`: the queue of
+			// completed lines grows without a consumer.
+			const { server, first } = await startServer(() => {});
+
+			const sock = await rawConnect(server);
+			sock.write("auth-ok\n");
+			await first;
+			// 1001 small complete frames: the 1001st pushes the backlog past
+			// the cap and the connection must be destroyed (with a warn log,
+			// like the oversize path).
+			const payload = `${"x".repeat(500)}\n`;
+			sock.write(payload.repeat(1001));
+			await new Promise<void>((resolve) => sock.once("close", resolve));
+
+			const logged = consoleWarn.mock.calls.flat().map((part) => String(part)).join("\n");
+			expect(logged).toContain("[pi-peers]");
+			expect(logged).toContain("lines queued");
+		} finally {
+			consoleWarn.mockRestore();
+		}
+	});
+
+	it("streams at or below the queued-line cap unaffected", async () => {
+		const { server, first } = await startServer((conn, _firstLine, lines) => {
+			void (async () => {
+				// Drain late: only after the whole burst has been buffered.
+				for await (const line of lines) {
+					conn.writeLine(line);
+				}
+				await conn.end();
+			})();
+		});
+
+		const client = await transport.connect(server.address.address);
+		client.writeLine("auth");
+		await first;
+		// Exactly the cap's worth of lines: no destroy, all echo back.
+		for (let i = 0; i < 1000; i++) {
+			client.writeLine(`l-${i}`);
+		}
+		await client.end();
+
+		const echoed: string[] = [];
+		for await (const line of transport.readLines(client)) {
+			echoed.push(line);
+		}
+		expect(echoed.length).toBe(1000);
+		expect(echoed[0]).toBe("l-0");
+		expect(echoed[999]).toBe("l-999");
+	});
+
 	it("logs a console.error and still resolves when end()'s flush fails", async () => {
 		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {

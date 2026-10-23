@@ -38,6 +38,14 @@ const PIPE_ADDRESS_PREFIX = "pipe:";
 /** Wire address prefix for unix sockets; the value is the absolute path. */
 const SOCK_ADDRESS_PREFIX = "sock:";
 
+/**
+ * Max completed lines buffered per connection while no consumer drains
+ * them (e.g. policy "ask" parking the pipeline behind a 60s confirm).
+ * Beyond this the connection is destroyed like an oversize line: a sender
+ * outrunning its consumer must not grow our heap unboundedly.
+ */
+const PEER_MAX_QUEUED_LINES = 1000;
+
 /** Extra listen options; lets tests shorten the first-line deadline. */
 export interface PeerListenOptions {
 	firstLineTimeoutMs?: number;
@@ -190,7 +198,9 @@ function endQueue(queue: LineQueue): void {
  *
  * Splitting on `\n` only (StringDecoder for cross-chunk UTF-8) mirrors the
  * JSONL reader. Any line whose wire size exceeds PEER_MAX_LINE_BYTES —
- * complete or still buffered — destroys the socket immediately.
+ * complete or still buffered — destroys the socket immediately, and a
+ * completed-line backlog beyond PEER_MAX_QUEUED_LINES (consumer stalled,
+ * e.g. policy "ask" behind a confirm dialog) destroys it the same way.
  */
 function attachLineFraming(socket: Socket, queue: LineQueue): void {
 	const decoder = new StringDecoder("utf8");
@@ -227,6 +237,13 @@ function attachLineFraming(socket: Socket, queue: LineQueue): void {
 				return;
 			}
 			pushLine(queue, line);
+			if (queue.lines.length > PEER_MAX_QUEUED_LINES) {
+				console.warn(
+					`[pi-peers] connection dropped: more than ${PEER_MAX_QUEUED_LINES} lines queued without a consumer`,
+				);
+				drop();
+				return;
+			}
 		}
 
 		if (pendingBytes > PEER_MAX_LINE_BYTES) {

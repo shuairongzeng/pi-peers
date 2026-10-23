@@ -50,6 +50,30 @@ const IDLE_SUB_MAX = 64;
 const PREVIEW_MAX_CHARS = 500;
 
 // ---------------------------------------------------------------------------
+// Receipt reflection budget
+// ---------------------------------------------------------------------------
+
+/** One token-bucket entry per sender of receipt-able frames. */
+interface ReceiptBucket {
+	tokens: number;
+	lastRefillMs: number;
+}
+
+/**
+ * Receipt-reflection budget per sender. An authenticated peer flooding us
+ * with frames would otherwise be answered with one outbound control frame
+ * (a fresh connect + key read each) per inbound frame — a reflection
+ * amplifier. Each sender gets a small token bucket; once exhausted the
+ * receipt is silently skipped (senders already treat receipt silence as
+ * delivery failure and re-send with their own pacing).
+ */
+const RECEIPT_BURST = 4;
+/** Refill rate: one token per 2 seconds of wall time. */
+const RECEIPT_REFILL_MS = 2000;
+/** Prune budget entries idle longer than this (leak cap, no timers). */
+const RECEIPT_IDLE_TTL_MS = 10 * 60_000;
+
+// ---------------------------------------------------------------------------
 // Inbox
 // ---------------------------------------------------------------------------
 
@@ -65,10 +89,49 @@ export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 	let queuedCount = 0;
 	/** One-shot notify_when_idle subscriptions, keyed by their envelope msg_id. */
 	const idleSubs = new Map<string, IdleSub>();
+	/** Receipt-budget buckets, keyed by sender wire address. */
+	const receiptBuckets = new Map<string, ReceiptBucket>();
 
 	/**
-	 * Report a receipt for a user frame. The status frame carries our own
-	 * identity, a fresh envelope, and msg_id of the frame being acknowledged.
+	 * Try to consume one receipt token for `sender`. Refills elapsed-time
+	 * tokens first (capped at the burst size), prunes entries idle beyond
+	 * RECEIPT_IDLE_TTL_MS so the map cannot leak (same prune-on-use pattern
+	 * as evictIdleSubs; no timers). Returns false when the bucket is empty:
+	 * the receipt must then be skipped silently — no host notify, since
+	 * receipt traffic is invisible to the user by design.
+	 */
+	function tryConsumeReceiptToken(sender: string): boolean {
+		const now = Date.now();
+		for (const [key, bucket] of receiptBuckets) {
+			if (key !== sender && now - bucket.lastRefillMs >= RECEIPT_IDLE_TTL_MS) {
+				receiptBuckets.delete(key);
+			}
+		}
+		const existing = receiptBuckets.get(sender);
+		if (existing === undefined) {
+			receiptBuckets.set(sender, { tokens: RECEIPT_BURST - 1, lastRefillMs: now });
+			return true;
+		}
+		const elapsed = now - existing.lastRefillMs;
+		if (elapsed >= RECEIPT_REFILL_MS) {
+			const refilled = Math.min(
+				RECEIPT_BURST,
+				existing.tokens + Math.floor(elapsed / RECEIPT_REFILL_MS),
+			);
+			existing.tokens = refilled;
+			existing.lastRefillMs = now;
+		}
+		if (existing.tokens <= 0) {
+			return false;
+		}
+		existing.tokens--;
+		return true;
+	}
+
+	/**
+	 * Report a receipt for a user frame — subject to the per-sender budget
+	 * (tryConsumeReceiptToken): the status frame carries our own identity, a
+	 * fresh envelope, and msg_id of the frame being acknowledged.
 	 */
 	async function sendReceipt(
 		original: PeerUserFrame,
@@ -85,6 +148,11 @@ export function createPeerInbox(deps: PeerInboxDeps): PeerInbox {
 			state,
 			...(reason !== undefined ? { reason } : {}),
 		};
+		// Budgeted per sender: an over-budget sender's receipt is dropped
+		// silently (no host notify) — receipt spam is invisible by design.
+		if (!tryConsumeReceiptToken(original.from)) {
+			return;
+		}
 		// Receipts are best-effort: a sendControl failure (peer gone, address
 		// unreachable) must never fail the inbound message handling itself.
 		try {

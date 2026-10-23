@@ -1,7 +1,7 @@
 import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -367,6 +367,58 @@ describe("list self-healing", () => {
 		}
 	});
 
+	it("deletes records whose name is not already normalized (control chars, case, whitespace)", () => {
+		freshRegistry();
+		// Legit publishers run names through normalizeName() before writing, so
+		// a raw name here is a foreign/corrupt writer. Control chars would render
+		// raw into /peers and tool output.
+		const patches: Array<Partial<PeerRecord>> = [
+			{ name: "proj\u001b[31mx" },
+			{ name: "Alice Cooper" },
+			{ name: " padded " },
+		];
+		for (const patch of patches) {
+			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			registry.list({ fresh: true });
+			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
+		}
+	});
+
+	it("deletes records with an over-long name", () => {
+		freshRegistry();
+		const overLong = { ...makeRecord(DEAD_PID), name: "a".repeat(65) };
+		writeFileSync(recordFile(DEAD_PID), JSON.stringify(overLong));
+		registry.list({ fresh: true });
+		expect(existsSync(recordFile(DEAD_PID))).toBe(false);
+	});
+
+	it("deletes records with control characters in cwd, sessionId, or socketPath", () => {
+		freshRegistry();
+		const patches: Array<Partial<PeerRecord>> = [
+			{ cwd: "D:/bad\u0007path" },
+			{ sessionId: "sess\u001besc" },
+			{ socketPath: "sock\u007fnext" },
+		];
+		for (const patch of patches) {
+			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			registry.list({ fresh: true });
+			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
+		}
+	});
+
+	it("deletes records with over-long cwd or sessionId", () => {
+		freshRegistry();
+		const patches: Array<Partial<PeerRecord>> = [
+			{ cwd: `D:/${"x".repeat(512)}` },
+			{ sessionId: "s".repeat(129) },
+		];
+		for (const patch of patches) {
+			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			registry.list({ fresh: true });
+			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch).slice(0, 40)}`).toBe(false);
+		}
+	});
+
 	it("ignores non-record files in the directory", () => {
 		freshRegistry();
 		writeFileSync(join(peersDir, "readme.txt"), "hello");
@@ -394,6 +446,27 @@ describe("list self-healing", () => {
 		writeFileSync(join(peersDir, `.${DEAD_PID}.json.tmp-abc123`), "{ partial");
 		registry.publish(makeRecord(LIVE_PID, { name: "alice" }));
 		expect(registry.list()).toHaveLength(1);
+	});
+
+	it("sweeps an orphan dot-tmp file older than the 60s grace period", () => {
+		freshRegistry();
+		const stale = join(peersDir, `.${DEAD_PID}.json.tmp-abc123`);
+		writeFileSync(stale, "{ partial");
+		// Backdate mtime beyond the grace period: a crash between an atomic
+		// write's temp creation and its rename left this file behind.
+		const staleTime = new Date(Date.now() - 120_000);
+		utimesSync(stale, staleTime, staleTime);
+		registry.list();
+		expect(existsSync(stale)).toBe(false);
+	});
+
+	it("keeps a fresh dot-tmp file: a concurrent writer's temp must survive", () => {
+		freshRegistry();
+		// mtime is now — inside the grace period, so the sweep must not touch it.
+		const fresh = join(peersDir, `.${LIVE_PID}.json.tmp-deadbe`);
+		writeFileSync(fresh, "{ partial");
+		registry.list();
+		expect(existsSync(fresh)).toBe(true);
 	});
 });
 
@@ -548,8 +621,7 @@ describe("resolve", () => {
 
 	it("is case- and whitespace-insensitive on names", () => {
 		freshRegistry();
-		registry.publish(makeRecord(LIVE_PID, { name: "Alice Cooper" }));
-		expect(registry.resolve("  alice cooper ")).toMatchObject({ kind: "unique" });
+		registry.publish(makeRecord(LIVE_PID, { name: "alice-cooper" }));
 		expect(registry.resolve("ALICE   COOPER")).toMatchObject({ kind: "unique" });
 	});
 

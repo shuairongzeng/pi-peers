@@ -10,7 +10,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { basename, dirname, join } from "node:path";
 import type { PeerRecord, PeerRegistry, PeerRegistryEntry, PeerResolution } from "./types.ts";
@@ -22,6 +22,18 @@ import { socketPathFromAddress } from "./transport.ts";
 // Boundary parsing: registry files are written by other processes, possibly
 // other versions, so every field is checked before the value is trusted.
 // ---------------------------------------------------------------------------
+
+/** Record-field hygiene bounds (parsePeerRecord): lengths and control chars.
+ * Legit publishers stay far inside these; anything past them is a foreign or
+ * corrupt writer. C0/C1/DEL must never reach terminal-rendered output. */
+const PEER_NAME_MAX_CHARS = 64;
+const PEER_CWD_MAX_CHARS = 512;
+const PEER_SESSION_ID_MAX_CHARS = 128;
+const PEER_CONTROL_CHARS_RE = /[\x00-\x1f\x7f-\x9f]/;
+/** Dot-tmp leftovers from atomicWriteFileSync: `.<name>.tmp-<hex>` (auth.ts writes `.<name>.<hex>.tmp`). */
+const PEER_TMP_FILE_RE = /^\..*\.tmp(-[0-9a-f]+)?$/;
+/** A concurrent writer's tmp must not be swept mid-flight; older ones are orphans. */
+const PEER_TMP_GRACE_MS = 60_000;
 
 /** Parse a JSON value as a PeerRecord; undefined when malformed. */
 function parsePeerRecord(value: unknown): PeerRecord | undefined {
@@ -39,6 +51,19 @@ function parsePeerRecord(value: unknown): PeerRecord | undefined {
 		return undefined;
 	}
 	if (typeof r.cwd !== "string" || typeof r.name !== "string" || r.name === "") {
+		return undefined;
+	}
+	// Field hygiene: legit publishers normalize the name at publish time and
+	// never write control chars into path-like fields — anything else is a
+	// foreign/corrupt writer. These fields render raw into /peers and tool
+	// output, so C0/C1/DEL control characters must never pass through.
+	if (r.name !== normalizeName(r.name) || r.name.length > PEER_NAME_MAX_CHARS) {
+		return undefined;
+	}
+	if (r.cwd.length > PEER_CWD_MAX_CHARS || r.sessionId.length > PEER_SESSION_ID_MAX_CHARS) {
+		return undefined;
+	}
+	if (PEER_CONTROL_CHARS_RE.test(r.cwd) || PEER_CONTROL_CHARS_RE.test(r.sessionId)) {
 		return undefined;
 	}
 	if (r.nameSource !== "user" && r.nameSource !== "derived" && r.nameSource !== "env") {
@@ -63,6 +88,9 @@ function parsePeerRecord(value: unknown): PeerRecord | undefined {
 		return undefined;
 	}
 	if (typeof r.socketPath !== "string" || r.socketPath === "") {
+		return undefined;
+	}
+	if (PEER_CONTROL_CHARS_RE.test(r.socketPath)) {
 		return undefined;
 	}
 	if (typeof r.peerProtocol !== "number") {
@@ -105,8 +133,14 @@ function atomicWriteFileSync(path: string, data: string): void {
 	try {
 		writeFileSync(temp, data, { encoding: "utf8", mode: 0o600 });
 		renameSync(temp, path);
-	} finally {
-		rmSync(temp, { force: true });
+	} catch (error) {
+		try {
+			rmSync(temp, { force: true });
+		} catch {
+			// Best-effort cleanup; the write/rename error is the real failure.
+			// (Windows AV can hold the temp file: EBUSY/EPERM must not mask it.)
+		}
+		throw error;
 	}
 }
 
@@ -483,6 +517,25 @@ export function createPeerRegistry(peersDir: string): PeerRegistry {
 					alive = (err as NodeJS.ErrnoException).code === "EPERM";
 				}
 				if (!alive) silentUnlink(join(peersDir, name));
+			}
+		}
+		// Orphan dot-tmp files (a crash between an atomic write's temp-file
+		// creation and its rename) are invisible to the record/key sweeps above,
+		// so without this they leak forever. A 60s grace period protects a
+		// concurrent writer's in-flight temp file from being deleted mid-write.
+		for (const name of readDirNames(peersDir)) {
+			if (!PEER_TMP_FILE_RE.test(name)) {
+				continue;
+			}
+			const path = join(peersDir, name);
+			let mtimeMs: number;
+			try {
+				mtimeMs = statSync(path).mtimeMs;
+			} catch {
+				continue; // Raced away (or locked): the next scan re-tries.
+			}
+			if (now - mtimeMs >= PEER_TMP_GRACE_MS) {
+				silentUnlink(path);
 			}
 		}
 		entries.sort((a, b) => a.record.pid - b.record.pid);

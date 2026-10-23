@@ -1782,6 +1782,67 @@ describe("createPeerInbox", () => {
 		expect(guard.childChecks).toEqual([frame.from, frame.from]);
 	});
 
+	it("receipt budget: a 10-frame burst from one sender gets at most 4 receipts", async () => {
+		const { inbox, host, outbox } = makeInbox({ host: { policy: "all" } });
+		const raw = "not a wrapper";
+
+		for (let i = 1; i <= 10; i++) {
+			await inbox.handleFrame(userFrame({ msg_id: `flood-${i}`, rawContent: raw }), "peer");
+		}
+
+		// Burst capacity 4: the first four malformed-wrapper frames are
+		// receipted, the remaining six silently skipped (no host notify —
+		// receipt traffic is invisible to the user by design).
+		expect(outbox.controlCalls.length).toBe(4);
+		for (const call of outbox.controlCalls) {
+			const status = call.frame as PeerMessageStatusFrame;
+			expect(status.state).toBe("dropped");
+			expect(status.reason).toBe("malformed-wrapper");
+		}
+		expect(host.userNotifies).toEqual([]);
+		expect(host.notices).toEqual([]);
+	});
+
+	it("receipt budget: after the refill interval a further frame is receipted again", async () => {
+		const { inbox, outbox } = makeInbox({ host: { policy: "all" } });
+
+		for (let i = 1; i <= 10; i++) {
+			await inbox.handleFrame(userFrame({ msg_id: `flood-${i}`, rawContent: "junk" }), "peer");
+		}
+		expect(outbox.controlCalls.length).toBe(4);
+
+		// 2 seconds later the bucket has refilled one token: a further frame
+		// gets its receipt again.
+		vi.useFakeTimers();
+		vi.setSystemTime(Date.now() + 2000);
+		await inbox.handleFrame(userFrame({ msg_id: "after-wait", rawContent: "junk" }), "peer");
+		vi.useRealTimers();
+
+		expect(outbox.controlCalls.length).toBe(5);
+		const status = outbox.controlCalls[4]!.frame as PeerMessageStatusFrame;
+		expect(status.msg_id).toBe("after-wait");
+		expect(status.state).toBe("dropped");
+		expect(status.reason).toBe("malformed-wrapper");
+	});
+
+	it("receipt budget: buckets are independent per sender", async () => {
+		const { inbox, outbox } = makeInbox({ host: { policy: "all" } });
+		const other = `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+
+		// Sender A exhausts its burst entirely.
+		for (let i = 1; i <= 6; i++) {
+			await inbox.handleFrame(userFrame({ msg_id: `a-${i}`, rawContent: "junk" }), "peer");
+		}
+		// Sender B is unaffected: first frame still gets a receipt.
+		await inbox.handleFrame(
+			userFrame({ msg_id: `b-1`, from: other, rawContent: "junk" }),
+			"peer",
+		);
+
+		expect(outbox.controlCalls.length).toBe(5);
+		expect((outbox.controlCalls[4]!.frame as PeerMessageStatusFrame).msg_id).toBe("b-1");
+	});
+
 	it("idleSubs: the 65th subscription evicts the oldest", async () => {
 		const transport = makeTransport();
 		const { inbox, outbox } = makeInbox({ transport });
