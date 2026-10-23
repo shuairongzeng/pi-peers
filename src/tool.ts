@@ -117,7 +117,7 @@ Sends a message to another running pi instance ("peer") on the same machine. The
 - If several sessions share one name, the send fails with a candidate list; resend with "name [ref]" to disambiguate, e.g. "alice [ab12cd]".
 - \`action: "shutdown"\` asks the peer to close its session gracefully. The peer's own accept policy decides: with "ask" the human there may be asked to confirm, and it may refuse. Collect any results or state you need from the peer BEFORE shutting it down — after it exits there is nothing left to ask.
 - \`notifyWhenIdle\`: also subscribes (once) to be notified when the peer next becomes idle.
-- Success only means the message reached the peer's queue. A receipt (delivered / held / denied / expired / refused / dropped) follows asynchronously and is injected into your context when it arrives.
+- Success only means the message reached the peer's queue. Success is silent: you hear nothing more about delivery. Failures (denied / expired / refused / dropped) and the peer's reply arrive as messages in later turns. Never poll, sleep, or wait for either — after sending, continue with other work or end your turn.
 - Silence is not consent: no reply within a timeout does not mean the peer agreed or acted.
 - \`to\` accepts an array of peer names (up to 32) to batch-send the same message to all of them: one send per target, a failing target does not stop the rest, and the result reports one line per target. Batch sends cannot use \`notifyWhenIdle\`.
 - For large content, write it to a file and send the file path in the message; each message is capped at 1 MiB on the wire.`;
@@ -458,7 +458,7 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 						content: [
 							{
 								type: "text",
-								text: `Sent to ${target} [${attempted.outcome.to}] (msg_id ${attempted.outcome.msgId}). Receipt will follow asynchronously.${notifyNote}`,
+								text: `Sent to ${target} [${attempted.outcome.to}] (msg_id ${attempted.outcome.msgId}). Success is silent — failures and any reply arrive as messages in later turns; do not wait or poll for them.${notifyNote}`,
 							},
 						],
 						details: {},
@@ -510,7 +510,7 @@ export function createPeerMessageTool(deps: PeerToolDeps): PeersToolDefinition<P
 			const failureGroups = [...failuresByCode.entries()].map(([code, count]) => `${count} ${code}`).join(", ");
 			const header =
 				failures === 0
-					? `Sent to ${params.to.length} peers. Receipts will follow asynchronously.`
+					? `Sent to ${params.to.length} peers. Success is silent — failures and replies arrive as messages in later turns; do not wait or poll for them.`
 					: okCount === 0
 						? `Send failed for all ${params.to.length} targets.`
 						: `Sent to ${okCount} of ${params.to.length} targets; ${failures} failed (${failureGroups}).`;
@@ -606,7 +606,9 @@ export function createPeerSpawnTool(deps: PeerToolDeps): PeersToolDefinition<Pee
 						details: { ...outcome },
 					};
 				}
-				const taskNote = outcome.taskSent ? "Task delivered." : "No task given.";
+				const taskNote = outcome.taskSent
+					? "Task delivered. Its reply arrives as a message in a later turn — do not wait or poll for it."
+					: "No task given.";
 				return {
 					content: [
 						{

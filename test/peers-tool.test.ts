@@ -152,7 +152,7 @@ describe("createPeerMessageTool", () => {
 		expect(text).toContain("msg_id m-42");
 		expect(text).toContain('"alpha"');
 		expect(text).toContain("pipe:LOCAL\\pi-peer-aaa");
-		expect(text).toContain("Receipt will follow asynchronously");
+		expect(text).toContain("Success is silent");
 	});
 
 	it("passes priority and notifyWhenIdle to the outbox", async () => {
