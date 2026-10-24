@@ -28,23 +28,58 @@ No server, no config files, no accounts — discovery is a directory (`~/.pi-pee
 
 ## Install
 
-Requires a recent pi or oh-my-pi (both load TypeScript extensions natively; no build step). Developed and tested against oh-my-pi 18.12.
+Requires a recent pi or oh-my-pi (both load TypeScript extensions natively; no build step) and Node.js ≥ 20. See [Host compatibility](#host-compatibility) for the tested baseline.
 
 ### pi
+
+Install from npm — pi's package manager resolves the `npm:` source, installs the package, and loads the extension entry its `pi.extensions` manifest names (nothing to add to settings by hand):
+
+```sh
+pi install npm:@shuairongzeng/pi-peers
+```
+
+`pi update --extensions` updates it later; `pi remove npm:@shuairongzeng/pi-peers` removes it.
+
+<details>
+<summary>Alternative: git clone (pinned to a checkout)</summary>
 
 ```sh
 git clone https://github.com/shuairongzeng/pi-peers ~/.pi/agent/extensions/pi-peers
 cd ~/.pi/agent/extensions/pi-peers && npm install
 ```
 
+</details>
+
 ### oh-my-pi
+
+Install from npm — `omp plugin install` classifies scoped `@…` specs as npm targets, records the package in `~/.omp/plugins`, and the runtime loader reads the `omp.extensions` manifest entry:
+
+```sh
+omp plugin install @shuairongzeng/pi-peers
+```
+
+<details>
+<summary>Alternative: git clone (pinned to a checkout)</summary>
 
 ```sh
 git clone https://github.com/shuairongzeng/pi-peers ~/.omp/agent/extensions/pi-peers
 cd ~/.omp/agent/extensions/pi-peers && npm install
 ```
 
+</details>
+
 Restart any running windows. Every new window now joins the peer network automatically.
+
+## Host compatibility
+
+| Host | Baseline |
+| --- | --- |
+| [oh-my-pi](https://github.com/can1357/oh-my-pi) | 18.12 (development & test baseline) |
+| [pi](https://github.com/earendil-works/pi) | fork, `shuairongzeng/pi` @ coding-agent 1.3.0 (development & test baseline) |
+| Protocol | `peerProtocol` v1 (`msgV: 1`) — senders refuse peers whose `peerProtocol` exceeds their own |
+| Node.js | ≥ 20 (matches the `engines` field in `package.json`) |
+
+Both hosts are loaded from one code path (`src/index.ts` normalizes the pi/oh-my-pi API differences), so pi and oh-my-pi windows share one registry and interoperate transparently.
 
 ## Usage
 
