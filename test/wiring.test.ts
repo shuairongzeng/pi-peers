@@ -578,6 +578,29 @@ describe("peers plugin wiring (dual-host)", () => {
 		}
 	});
 
+	it("turn_start refreshes a materially-changed context usage, skips noise", async () => {
+		let pct = 10;
+		const { pi, handlers } = createFakePi();
+		peersExtension(pi);
+		const ctx = createFakeCtx(peersDir, {
+			getContextUsage: () => ({ tokens: Math.round((15_000 * pct) / 100), contextWindow: 15_000, percent: pct }),
+		});
+		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);
+		// Our own freshly-published record — the shape is the one we just wrote.
+		const usageOf = (): number | undefined => (readOwnRecord().contextUsage as { percent?: number } | undefined)?.percent;
+		expect(usageOf()).toBe(10);
+
+		// Sub-1pp wiggle: no republish (record file untouched).
+		pct = 10.4;
+		await handlers.get("turn_start")?.({ type: "turn_start" }, ctx);
+		expect(usageOf()).toBe(10);
+
+		// Material change: republished.
+		pct = 42;
+		await handlers.get("turn_start")?.({ type: "turn_start" }, ctx);
+		expect(usageOf()).toBe(42);
+	});
+
 	it("ephemeral quit still fires when notify throws and usage snapshot explodes", async () => {
 		process.env.PI_PEERS_EPHEMERAL = "1";
 		let quitCalls = 0;

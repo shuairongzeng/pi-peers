@@ -485,6 +485,32 @@ export default function peersExtension(pi: PeersHostAPI): void {
 		setStatus("busy");
 	});
 
+	// Usage drift repair: a session can stay busy for hours; without this the
+	// advertised contextUsage freezes at flip time. turn_start fires per turn on
+	// both hosts — republish only on a material change (≥1pp) to avoid churn.
+	pi.on("turn_start", (_event: unknown, eventCtx) => {
+		ctx = eventCtx;
+		if (record === undefined) return;
+		let usage: { tokens?: number | null; contextWindow?: number; percent?: number | null } | undefined;
+		try {
+			usage = ctx.getContextUsage?.();
+		} catch {
+			return;
+		}
+		if (usage === undefined) return;
+		const prevPct = record.contextUsage?.percent ?? undefined;
+		const nextPct = usage.percent ?? undefined;
+		// In-memory stays exact; disk rewrites only when the displayed value
+		// (whole-percent ctx%) moved — per-turn writes otherwise churn the file.
+		record = { ...record, contextUsage: usage };
+		if (prevPct !== undefined && nextPct !== undefined && Math.abs(prevPct - nextPct) < 1) return;
+		try {
+			registry.update(process.pid, { contextUsage: usage });
+		} catch {
+			// in-memory record stays authoritative
+		}
+	});
+
 	// Ephemeral instances (spawned with PI_PEERS_EPHEMERAL=1) quit on the first
 	// idle after having done work — one task, one report-back, exit.
 	const ephemeral = /^(1|true|yes)$/i.test(process.env[ENV_PEERS_EPHEMERAL] ?? "");
