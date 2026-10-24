@@ -456,4 +456,136 @@ describe("createPeerSpawner", () => {
 			child?.kill();
 		}
 	}, 20_000);
+
+	it("register timeout message reports a dead headless child with stderr guidance", async () => {
+		// A deterministically dead pid: a short-lived node process that exits
+		// immediately (its pid may not be recycled this fast, but the exit event
+		// guarantees the process is gone before the 300ms register window ends).
+		const { promise: dead, resolve: markDead } = Promise.withResolvers<void>();
+		let deadPid: number | undefined;
+		const dyingExec: PeerExec = (_command, _args, options) => {
+			const proc = nodeSpawn(process.execPath, ["-e", "process.exit(0);"], {
+				cwd: tmpdir(),
+				env: options.env,
+				stdio: "ignore",
+			});
+			deadPid = proc.pid;
+			proc.once("exit", () => markDead());
+			return { pid: proc.pid, kill: () => proc.kill(), onError: (cb) => proc.once("error", cb) };
+		};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec: dyingExec,
+		});
+		// Race-free ordering: the spawn call starts the child, then we await its
+		// real exit event; the error's promise settles only after the register
+		// deadline (>= 300ms), which the exited child comfortably precedes on
+		// the event loop. The probe then sees ESRCH deterministically.
+		const errorPromise = spawner({ name: "dead-worker", headless: true }).then(
+			() => {
+				throw new Error("expected register_timeout");
+			},
+			(e: unknown) => e,
+		);
+		await dead;
+		const error = await errorPromise;
+		expect(error).toBeInstanceOf(PeerSpawnError);
+		expect(error).toMatchObject({ kind: "register_timeout" });
+		const message = (error as PeerSpawnError).message;
+		expect(message).toContain('spawned "dead-worker" but it did not register within 0s');
+		expect(message).toContain("has exited");
+		expect(message).toContain("run with a visible window or check the child's stderr via the host");
+	});
+
+	it("register timeout message reports a live headless child and differs from the dead variant", async () => {
+		// Live keeper as the child: probe says "is still running".
+		const keeper = nodeSpawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
+			cwd: tmpdir(),
+			stdio: "ignore",
+		});
+		try {
+			const registry = createPeerRegistry(peersDir);
+			const spawner = createPeerSpawner({
+				registry,
+				outbox: fakeOutbox([]),
+				cwd: () => peersDir,
+				registerTimeoutMs: 300,
+				exec: () => ({ pid: keeper.pid, kill: () => {}, onError: () => {} }),
+			});
+			const liveError = await spawner({ name: "live-worker", headless: true }).then(
+				() => {
+					throw new Error("expected register_timeout");
+				},
+				(e: unknown) => e,
+			);
+			expect(liveError).toBeInstanceOf(PeerSpawnError);
+			const liveMessage = (liveError as PeerSpawnError).message;
+			expect(liveMessage).toContain("is still running");
+			expect(liveMessage).toContain("run with a visible window or check the child's stderr via the host");
+
+			// Same scenario, dead pid (deterministically ESRCH — a pid that has
+			// exited and is not recycled by the keeper above).
+			const deadKeeper = nodeSpawn(process.execPath, ["-e", "process.exit(0);"], {
+				cwd: tmpdir(),
+				stdio: "ignore",
+			});
+			await new Promise<void>((resolve) => deadKeeper.once("exit", () => resolve()));
+			const deadPid = deadKeeper.pid;
+			if (deadPid === undefined) throw new Error("dead keeper never spawned");
+			expect(() => process.kill(deadPid, 0)).toThrow();
+			const spawner2 = createPeerSpawner({
+				registry: createPeerRegistry(peersDir),
+				outbox: fakeOutbox([]),
+				cwd: () => peersDir,
+				registerTimeoutMs: 300,
+				exec: () => ({ pid: deadPid, kill: () => {}, onError: () => {} }),
+			});
+			const deadError = await spawner2({ name: "live-worker", headless: true }).then(
+				() => {
+					throw new Error("expected register_timeout");
+				},
+				(e: unknown) => e,
+			);
+			expect(deadError).toBeInstanceOf(PeerSpawnError);
+			const deadMessage = (deadError as PeerSpawnError).message;
+			expect(deadMessage).toContain("has exited");
+			// The two variants differ exactly on the aliveness phrase.
+			expect(liveMessage).not.toBe(deadMessage);
+			expect(liveMessage.replace("is still running", "X")).not.toContain("has exited");
+			expect(deadMessage.replace("has exited", "X")).not.toContain("is still running");
+		} finally {
+			keeper.kill();
+		}
+	});
+
+	it("register timeout message for a visible spawn points at the spawned window", async () => {
+		// Visible path (headless omitted): the deadline runs out scanning for
+		// the assigned name that never appears. The stub pid is this process
+		// (alive) — visible spawns can't poll the pid, the probe still reports it.
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec: () => ({ pid: process.pid, kill: () => {}, onError: () => {} }),
+		});
+		const error = await spawner({ name: "window-worker" }).then(
+			() => {
+				throw new Error("expected register_timeout");
+			},
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(PeerSpawnError);
+		expect(error).toMatchObject({ kind: "register_timeout" });
+		const message = (error as PeerSpawnError).message;
+		expect(message).toContain("is still running");
+		expect(message).toContain("check the spawned window for a trust dialog or startup error");
+		// The headless-only guidance must not leak into the visible variant.
+		expect(message).not.toContain("stderr");
+	});
 });

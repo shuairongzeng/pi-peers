@@ -114,6 +114,8 @@ flowchart LR
 - **Anti-abuse**: inbound user frames pass a token-bucket rate limit, a dedupe window, a hop-chain guard (loop and runaway detection), and a queue cap; the outbox paces sends locally so a peer that would drop us fails fast with a merge-and-retry hint instead.
 - **No central server**: the filesystem is the only shared truth; the registry is self-healing (records of dead pids and their key files are swept on every scan).
 
+**Child-token exposure.** `PI_PEERS_SOCKET`/`PI_PEERS_TOKEN` are exported into the environment of every descendant process — any shell command the agent runs inherits them. That token authenticates child-class frames, which skip the accept policy (`PI_PEERS_ACCEPT=off` does NOT gate child frames) and can carry shutdown requests. This matches the documented trust model: on a single-user machine the user can already read the key files and do all of this — but do not treat `PI_PEERS_ACCEPT=off` as a sandbox against local processes.
+
 ## Known host differences
 
 - **oh-my-pi has no `session_info_changed`**: renames are not broadcast to other peers. A renamed oh-my-pi session republishes its (derived) name on the next `session_start`; until then, peers see the old name.

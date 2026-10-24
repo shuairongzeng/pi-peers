@@ -162,6 +162,37 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 	return promise;
 }
 
+/**
+ * Registration-timeout diagnostics: whether the child is still alive (a bare
+ * kill(pid, 0) probe, checked here rather than in the registry so spawn keeps
+ * only its types.ts deps) plus one actionable next step. A dead child usually
+ * died at the host's "Trust project folder?" dialog or a model-data/TUI
+ * startup failure the parent agent cannot see; a live one stalled before
+ * publishing its record.
+ */
+function registerTimeoutMessage(
+	name: string,
+	timeoutMs: number,
+	child: SpawnedProcess,
+	headless: boolean,
+): string {
+	let alive = false;
+	if (child.pid !== undefined) {
+		try {
+			process.kill(child.pid, 0);
+			alive = true;
+		} catch (err) {
+			// EPERM: exists but not signalable by us — still alive (registry idiom).
+			alive = (err as NodeJS.ErrnoException).code === "EPERM";
+		}
+	}
+	const base = `spawned "${name}" but it did not register within ${Math.round(timeoutMs / 1000)}s`;
+	if (headless) {
+		return `${base}; the child process ${alive ? "is still running" : "has exited"} — run with a visible window or check the child's stderr via the host to see why.`;
+	}
+	return `${base}; the child process ${alive ? "is still running" : "has exited"} — check the spawned window for a trust dialog or startup error.`;
+}
+
 export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 	const exec = deps.exec ?? defaultExec;
 	const timeoutMs = deps.registerTimeoutMs ?? 30_000;
@@ -234,10 +265,7 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 		}
 		if (entry === undefined) {
 			if (headless) child.kill();
-			throw new PeerSpawnError(
-				"register_timeout",
-				`spawned "${name}" but it did not register within ${Math.round(timeoutMs / 1000)}s`,
-			);
+			throw new PeerSpawnError("register_timeout", registerTimeoutMessage(name, timeoutMs, child, headless));
 		}
 
 		let taskSent = false;
