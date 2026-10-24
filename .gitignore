@@ -1,3 +1,8 @@
 node_modules/
 dist/
+coverage/
 *.log
+
+# Stryker mutation testing
+.stryker-tmp/
+reports/mutation/index.html
