@@ -1,20 +1,52 @@
 {
-  "name": "pi-peers",
+  "name": "@shuairongzeng/pi-peers",
   "version": "0.1.0",
   "description": "Cross-session messaging between pi-compatible coding agent instances on one machine (registry + named pipe/UDS + token auth + receipts). Works as an extension on pi and oh-my-pi.",
   "type": "module",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shuairongzeng/pi-peers.git"
+  },
+  "keywords": [
+    "pi",
+    "oh-my-pi",
+    "extension",
+    "peers",
+    "messaging",
+    "multi-agent",
+    "ipc"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "src",
+    "CHANGELOG.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "pi": { "extensions": ["./src/index.ts"] },
   "omp": { "extensions": ["./src/index.ts"] },
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "coverage": "vitest run --coverage",
+    "mutation": "stryker run",
+    "bench": "node bench/peers-bench.mjs",
+    "prepublishOnly": "npm run typecheck && npm test"
   },
   "peerDependencies": {
     "typebox": "*"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "^10.0.0",
+    "@stryker-mutator/vitest-runner": "^10.0.0",
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "^4.0.0",
+    "fast-check": "^4.0.0",
+    "publint": "^0.3.0",
     "typebox": "^1.0.0",
     "typescript": "^5.9.0",
     "vitest": "^4.0.0"
