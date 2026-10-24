@@ -116,6 +116,8 @@ flowchart LR
 
 **Child-token exposure.** `PI_PEERS_SOCKET`/`PI_PEERS_TOKEN` are exported into the environment of every descendant process — any shell command the agent runs inherits them. That token authenticates child-class frames, which skip the accept policy (`PI_PEERS_ACCEPT=off` does NOT gate child frames) and can carry shutdown requests. This matches the documented trust model: on a single-user machine the user can already read the key files and do all of this — but do not treat `PI_PEERS_ACCEPT=off` as a sandbox against local processes.
 
+**Accepted limitation — no post-auth connection caps.** Once a connection authenticates, there is no idle timeout or cap on concurrent inbound connections (frames themselves are rate-limited, line-buffered, and queue-capped). A token holder could pin connections to waste file descriptors — but a token holder is a same-user process, which can already `kill` this session outright. Adding caps would cost complexity without enlarging the trust boundary.
+
 ## Known host differences
 
 - **oh-my-pi has no `session_info_changed`**: renames are not broadcast to other peers. A renamed oh-my-pi session republishes its (derived) name on the next `session_start`; until then, peers see the old name.
