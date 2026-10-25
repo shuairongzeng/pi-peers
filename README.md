@@ -35,10 +35,10 @@ Requires a recent pi or oh-my-pi (both load TypeScript extensions natively; no b
 Install from npm — pi's package manager resolves the `npm:` source, installs the package, and loads the extension entry its `pi.extensions` manifest names (nothing to add to settings by hand):
 
 ```sh
-pi install npm:@shuairongzeng/pi-peers
+pi install npm:@zengcool/pi-peers
 ```
 
-`pi update --extensions` updates it later; `pi remove npm:@shuairongzeng/pi-peers` removes it.
+`pi update --extensions` updates it later; `pi remove npm:@zengcool/pi-peers` removes it.
 
 <details>
 <summary>Alternative: git clone (pinned to a checkout)</summary>
@@ -55,7 +55,7 @@ cd ~/.pi/agent/extensions/pi-peers && npm install
 Install from npm — `omp plugin install` classifies scoped `@…` specs as npm targets, records the package in `~/.omp/plugins`, and the runtime loader reads the `omp.extensions` manifest entry:
 
 ```sh
-omp plugin install @shuairongzeng/pi-peers
+omp plugin install @zengcool/pi-peers
 ```
 
 <details>

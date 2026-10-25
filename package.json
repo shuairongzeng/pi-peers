@@ -1,5 +1,5 @@
 {
-  "name": "@shuairongzeng/pi-peers",
+  "name": "@zengcool/pi-peers",
   "version": "0.1.0",
   "description": "Cross-session messaging between pi-compatible coding agent instances on one machine (registry + named pipe/UDS + token auth + receipts). Works as an extension on pi and oh-my-pi.",
   "type": "module",

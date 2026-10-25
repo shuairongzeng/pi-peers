@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * peers-bench.mjs — performance baseline for @shuairongzeng/pi-peers.
+ * peers-bench.mjs — performance baseline for @zengcool/pi-peers.
  *
  * Generates the numbers recorded in BENCH.md (the baseline for future
  * performance work on this package). Three sections, each printed as a table:
