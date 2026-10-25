@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-10-25
+
+### Fixed
+
+- **Silent message loss on mid-send peer death**: `PeerConnection.end()` swallowed flush
+  errors (logged, then resolved), so if the peer's socket died after our connect succeeded
+  but while frames were still flushing, `send()` returned success for bytes that never
+  arrived. `end()` now rejects on flush failure, and `send()` surfaces a typed
+  `PeerSendError` with the new code `connection_lost` (with retry guidance in the tool's
+  error text). A `connection_lost` failure also invalidates the sender's alive-cache entry
+  for that peer, like `connect_failed`/`timeout` already did. Receipt-window behavior
+  (peer dies after a successful send, before the receipt arrives) stays best-effort by design.
+
+### Changed
+
+- **Registry test fixtures**: field-validation tests now use live-pid fixtures with control
+  assertions, unmasking 42 `parsePeerRecord` validation mutants that dead-pid fixtures had
+  hidden (a wrongly-accepted malformed record was deleted by the liveness sweep anyway).
+  Mutation score re-baselined; see MUTATION.md.
+
+### Added
+
+- **Trusted publishing**: releases publish to npm from GitHub Actions via OIDC
+  (`.github/workflows/release.yml`) with provenance attestations — no npm token involved.
+
 ## [0.1.0] - 2026-10-24
 
 First public release. Cross-session messaging between pi-compatible coding agent instances

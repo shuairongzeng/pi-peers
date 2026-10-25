@@ -109,7 +109,7 @@ Tool reference (what the model sees):
 
 Peers are scoped by project: a session's project is its git repository root (or its working directory outside a work tree). By default, `list` and `send` only see sessions in **your** project — windows in other repositories are invisible and unreachable, so an agent can never accidentally task a window from an unrelated project. `/peers` shows your project's sessions and summarizes the rest as `(+N sessions in other projects …)`. To deliberately reach across projects, pass `scope: "all"` to the tool.
 
-Inbound messages arrive as user-role text wrapped in `<cross-session-message from="ADDRESS" from-name="NAME">…</cross-session-message>`, and the agent is instructed (via a system-prompt section the plugin injects) to reply by copying `from` into `to`. A send returns once the message reaches the peer's queue; an asynchronous receipt (`delivered` / `held` / `denied` / `refused` / `dropped`) follows into your session.
+Inbound messages arrive as user-role text wrapped in `<cross-session-message from="ADDRESS" from-name="NAME">…</cross-session-message>`, and the agent is instructed (via a system-prompt section the plugin injects) to reply by copying `from` into `to`. A send returns once the message reaches the peer's queue; an asynchronous receipt (`delivered` / `held` / `denied` / `refused` / `dropped`) follows into your session. If the peer's connection dies while your message is still being written, the send instead fails fast with a typed `connection_lost` error — a vanished peer never looks like a successful delivery.
 
 ## How it works
 
@@ -166,6 +166,15 @@ npm install        # once
 npm test           # vitest run
 npm run typecheck  # tsc --noEmit
 ```
+
+### Releasing
+
+Releases are fully automated via [npm Trusted Publishing](https://docs.npmjs.com/trusted-publishers)
+(OIDC from GitHub Actions — no npm token anywhere): bump `version` in `package.json`,
+update `CHANGELOG.md`, push, then tag `vX.Y.Z` and push the tag. The
+[release workflow](.github/workflows/release.yml) verifies the tag matches the manifest,
+runs the full typecheck + test gate, and publishes with a provenance attestation.
+The workflow refuses to publish on anything but a tag push.
 
 Source layout: `src/` holds the plugin; `src/types.ts` is the single dependency contract every module imports from; `src/index.ts` is the dual-host entry (pi + oh-my-pi API differences are normalized there). Tests in `test/` include a true end-to-end suite (two real protocol stacks exchanging frames over a live socket) and a dual-host wiring suite.
 
