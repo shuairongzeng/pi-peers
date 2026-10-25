@@ -131,13 +131,22 @@ describe("address validation and resolution", () => {
 
 	it("resolves pipe addresses to \\\\.\\pipe\\<name> and inverts addressFromPath", () => {
 		const name = pipeName();
-		// Without the LOCAL\ prefix.
-		expect(resolveAddress(`pipe:${name}`)).toBe(`\\\\.\\pipe\\${name}`);
-		// With the LOCAL\ prefix.
-		expect(resolveAddress(`pipe:LOCAL\\${name}`)).toBe(`\\\\.\\pipe\\LOCAL\\${name}`);
-		// addressFromPath maps the canonical LOCAL\ path back to the wire form.
-		expect(addressFromPath(`\\\\.\\pipe\\LOCAL\\${name}`)).toBe(`pipe:LOCAL\\${name}`);
-		// Derive -> address -> path round trip.
+		if (process.platform === "win32") {
+			// Without the LOCAL\ prefix.
+			expect(resolveAddress(`pipe:${name}`)).toBe(`\\\\.\\pipe\\${name}`);
+			// With the LOCAL\ prefix.
+			expect(resolveAddress(`pipe:LOCAL\\${name}`)).toBe(`\\\\.\\pipe\\LOCAL\\${name}`);
+			// addressFromPath maps the canonical LOCAL\ path back to the wire form.
+			expect(addressFromPath(`\\\\.\\pipe\\LOCAL\\${name}`)).toBe(`pipe:LOCAL\\${name}`);
+		} else {
+			// resolveAddress platform-gates pipe: off win32 (connect() could
+			// never reach it); addressFromPath only round-trips sock: paths.
+			expect(resolveAddress(`pipe:${name}`)).toBeUndefined();
+			expect(resolveAddress(`pipe:LOCAL\\${name}`)).toBeUndefined();
+			expect(addressFromPath(`\\\\.\\pipe\\LOCAL\\${name}`)).toBeUndefined();
+		}
+		// Derive -> address -> path round trip (pipe path on win32, sock: path
+		// on POSIX — each through its own platform's resolver).
 		const derived = deriveSocketAddress(tempDir("pi-peers-roundtrip-"));
 		expect(resolveAddress(derived.address)).toBe(derived.path);
 	});
@@ -774,9 +783,12 @@ describe("POSIX socket paths", () => {
 	it.skipIf(process.platform === "win32")("cleans up the socket file on close", async () => {
 		const peersDir = tempDir("pi-peers-posix-");
 		const derived = deriveSocketAddress(peersDir);
-		expect(statSync(derived.path)).toBeDefined();
-
+		// deriveSocketAddress only creates the socks/ directory — the socket
+		// file itself appears when the listener binds and is unlinked when
+		// it closes.
 		const server = await transport.listen(derived, () => {});
+		expect(statSync(derived.path).isSocket()).toBe(true);
+
 		await server.close();
 
 		let removed = false;

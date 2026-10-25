@@ -245,16 +245,17 @@ describe("peers plugin wiring (dual-host)", () => {
 	});
 
 	it("degrades to local-only when the registry dir is unusable", async () => {
-		// PI_PEERS_DIR points at a regular file: listen-side setup (key publish on
-		// POSIX dir creation / publishKey mkdir) and record publish both fail; the
-		// session must still come up, with a warning instead of an exception.
-		const notADir = join(peersDir, "not-a-dir");
-		writeFileSync(notADir, "x");
-		process.env.PI_PEERS_DIR = notADir;
+		// The record file's name is occupied by a directory: publishRecord's
+		// atomic rename over it fails identically on win32 (EPERM) and POSIX
+		// (EISDIR) — the session must still come up, with a warning instead
+		// of an exception. (A file-as-PI_PEERS_DIR also works on win32, but on
+		// POSIX deriveSocketAddress fails at plugin load — before
+		// session_start — and never reaches the publish-path degrade.)
+		mkdirSync(join(peersDir, `${process.pid}.json`));
 		const { pi, handlers } = createFakePi();
 		peersExtension(pi);
 		const messages: string[] = [];
-		const ctx = createFakeCtx(notADir, {
+		const ctx = createFakeCtx(peersDir, {
 			ui: { notify: (m: string) => messages.push(m), confirm: async () => true },
 		});
 		await handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, ctx);

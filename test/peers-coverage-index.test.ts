@@ -18,13 +18,14 @@
  */
 
 import { createConnection } from "node:net";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
 import peersExtension from "../src/index.ts";
 import { createPeerProtocol } from "../src/protocol.ts";
+import { createPeerAuth } from "../src/auth.ts";
 import {
 	PEER_KEY_FILE_RE,
 	PEER_RECORD_FILE_RE,
@@ -91,6 +92,7 @@ function createFakeCtx(cwd: string, overrides: Partial<PeersExtensionContext> = 
 }
 
 describe("peers plugin host-wiring coverage", () => {
+	const auth = createPeerAuth();
 	let peersDir: string;
 	const savedEnv: Record<string, string | undefined> = {};
 	const envKeys = [
@@ -316,15 +318,18 @@ describe("peers plugin host-wiring coverage", () => {
 	});
 
 	it("registry-dir unusable: warn() falls back to console.warn when the toast throws", async () => {
-		// peersDir is captured at plugin construction: set the broken dir
-		// BEFORE peersExtension() runs.
+		// The record file's name is occupied by a directory: registry.publish's
+		// atomic rename over it fails on every platform (EPERM on win32,
+		// EISDIR on POSIX), so publishRecord throws after the async gap and
+		// session_start must degrade with a warn() — the throwing toast then
+		// falls back to console.warn. (A file-as-PI_PEERS_DIR would also work
+		// on win32, but on POSIX deriveSocketAddress fails at plugin load —
+		// before session_start — so it cannot drive this event-path test.)
 		const messages: string[] = [];
-		const notADir = join(peersDir, "blocked");
-		writeFileSync(notADir, "x");
-		process.env.PI_PEERS_DIR = notADir;
+		mkdirSync(join(peersDir, `${process.pid}.json`));
 		const fake = createFakePi();
 		peersExtension(fake.pi);
-		const ctx = createFakeCtx(notADir, {
+		const ctx = createFakeCtx(peersDir, {
 			ui: {
 				notify: (m: string) => {
 					messages.push(m);
@@ -340,7 +345,6 @@ describe("peers plugin host-wiring coverage", () => {
 			expect(warnSpy).toHaveBeenCalled();
 		} finally {
 			warnSpy.mockRestore();
-			process.env.PI_PEERS_DIR = peersDir;
 		}
 	});
 
@@ -434,6 +438,24 @@ describe("peers plugin host-wiring coverage", () => {
 		// Record and key files are cleaned up by the quit path.
 		expect(readdirSync(peersDir).filter((f) => PEER_RECORD_FILE_RE.test(f))).toHaveLength(0);
 	});
+	/**
+	 * Fabricated inbound sender: a wire `from` address whose auth key exists
+	 * but whose endpoint is dead. On win32 that is any well-formed pipe:
+	 * sendControl resolves it, finds no key, and logs the drop. On POSIX the
+	 * fabricated pipe: address is platform-gated to invalid_target, which
+	 * inbox swallows silently — so the sender gets a sock: address plus a
+	 * published key, and the receipt's best-effort delivery surfaces as the
+	 * connect_failed console.error instead. Either platform: one module-owned
+	 * [peers] console.error line, no listener behind the address.
+	 */
+	function fabricatedSender(): string {
+		if (process.platform === "win32") {
+			return `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+		}
+		const senderPath = join(peersDir, "socks", "4242.sock");
+		auth.publishKey(peersDir, 4242, senderPath, auth.generateTokens(), undefined, "posix:probe");
+		return `sock:${senderPath}`;
+	}
 
 	/** One wired plugin + one inbound user frame from a fabricated sender. */
 	async function deliverWithPolicy(
@@ -448,7 +470,7 @@ describe("peers plugin host-wiring coverage", () => {
 		const keyName = readdirSync(peersDir).find((f) => PEER_KEY_FILE_RE.test(f));
 		if (keyName === undefined) throw new Error("no key file published");
 		const token = (JSON.parse(readFileSync(join(peersDir, keyName), "utf8")) as { peerToken: string }).peerToken;
-		const wireFrom = `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+		const wireFrom = fabricatedSender();
 		const wireAttrs: PeerContentAttrs = { from: wireFrom, fromSession: "sess-x", fromName: "x" };
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		const sock = createConnection(socketPath, () => {
@@ -532,7 +554,7 @@ describe("peers plugin host-wiring coverage", () => {
 			const keyName = readdirSync(peersDir).find((f) => PEER_KEY_FILE_RE.test(f));
 			if (keyName === undefined) throw new Error("no key file published");
 			const token = (JSON.parse(readFileSync(join(peersDir, keyName), "utf8")) as { peerToken: string }).peerToken;
-			const wireFrom = `pipe:LOCAL\\pi-peer-${"c".repeat(32)}`;
+			const wireFrom = fabricatedSender();
 			const { promise, resolve } = Promise.withResolvers<void>();
 			const sock = createConnection(socketPath, () => {
 				sock.write(`${JSON.stringify({ type: "auth", token })}\n`);
