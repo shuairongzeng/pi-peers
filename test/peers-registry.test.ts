@@ -93,6 +93,21 @@ function visibleFileNames(): string[] {
 }
 
 /**
+ * Liveness control for the invalid-field fixtures below: writes a VALID
+ * LIVE_PID record (key planted by makeRecord), scans, and asserts the file
+ * survives. The fixture pid being live is what makes those tests' deletion
+ * assertions meaningful — with a dead pid the liveness sweep deletes
+ * malformed records that parsePeerRecord wrongly accepted, so
+ * validation-relaxation mutants would survive (MUTATION.md §4 #1).
+ */
+function assertValidRecordSurvivesScan(overrides: Partial<PeerRecord> = {}): void {
+	const record = makeRecord(LIVE_PID, overrides);
+	writeFileSync(recordFile(LIVE_PID), JSON.stringify(record));
+	registry.list({ fresh: true });
+	expect(existsSync(recordFile(LIVE_PID)), "valid LIVE_PID record must survive a scan").toBe(true);
+}
+
+/**
  * Count real probes for one pid without changing their verdicts: isAlive()
  * probes via process.kill(pid, 0), so wrapping the original (bound before
  * the spy — calling process.kill inside would recurse into the mock) keeps
@@ -284,9 +299,10 @@ describe("list self-healing", () => {
 
 	it("deletes records with wrong version", () => {
 		freshRegistry();
-		writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), version: 2 }));
-		registry.list();
-		expect(existsSync(recordFile(DEAD_PID))).toBe(false);
+		assertValidRecordSurvivesScan();
+		writeFileSync(recordFile(LIVE_PID), JSON.stringify({ ...makeRecord(LIVE_PID), version: 2 }));
+		registry.list({ fresh: true });
+		expect(existsSync(recordFile(LIVE_PID))).toBe(false);
 	});
 
 	it("keeps orphan key files whose pid is alive (starting-up instance)", () => {
@@ -341,34 +357,83 @@ describe("list self-healing", () => {
 
 	it("deletes records with missing or mistyped required fields", () => {
 		freshRegistry();
+		assertValidRecordSurvivesScan();
+		// A valid string procStart must survive too: isAlive skips the starttime
+		// match when /proc is unobservable (Windows) and pins the observed value
+		// where it is observable — so the procStart check's false-rejection
+		// mutants die here, not just its acceptance relaxations below.
+		assertValidRecordSurvivesScan({ procStart: registry.readProcStart(LIVE_PID) ?? "0" });
 		const malformed: unknown[] = [
-			{ ...makeRecord(DEAD_PID), sessionId: undefined },
-			{ ...makeRecord(DEAD_PID), pid: "123" },
-			{ ...makeRecord(DEAD_PID), statusUpdatedAt: "soon" },
-			{ ...makeRecord(DEAD_PID), formerNames: "none" },
-			{ ...makeRecord(DEAD_PID), features: [1, 2] },
-			{ ...makeRecord(DEAD_PID), procStart: 42 },
+			null,
+			{ ...makeRecord(LIVE_PID), pid: "123" },
+			{ ...makeRecord(LIVE_PID), sessionId: undefined },
+			{ ...makeRecord(LIVE_PID), sessionId: "" },
+			{ ...makeRecord(LIVE_PID), name: 42 },
+			{ ...makeRecord(LIVE_PID), name: "" },
+			{ ...makeRecord(LIVE_PID), cwd: 42 },
+			{ ...makeRecord(LIVE_PID), statusUpdatedAt: "soon" },
+			{ ...makeRecord(LIVE_PID), startedAt: "soon" },
+			{ ...makeRecord(LIVE_PID), formerNames: "none" },
+			// Per-item formerNames shapes: null item, array item, and items whose
+			// name/until is not a string — each fails exactly one conjunct of the
+			// every() callback, so each relaxation is caught by a live pid.
+			{ ...makeRecord(LIVE_PID), formerNames: [null] },
+			{ ...makeRecord(LIVE_PID), formerNames: [[]] },
+			{ ...makeRecord(LIVE_PID), formerNames: [{ name: "x", until: 42 }] },
+			{ ...makeRecord(LIVE_PID), formerNames: [{ name: 42, until: "2026-01-01T00:00:00Z" }] },
+			{ ...makeRecord(LIVE_PID), features: [1, 2] },
+			{ ...makeRecord(LIVE_PID), procStart: 42 },
+			{ ...makeRecord(LIVE_PID), pidDomain: "" },
+			{ ...makeRecord(LIVE_PID), socketPath: "" },
+			// contextUsage must be an object when present: an array passes
+			// `typeof === "object"` and `!== null`, so only the remaining
+			// !Array.isArray conjunct rejects it.
+			{ ...makeRecord(LIVE_PID), contextUsage: [] },
 		];
 		for (const bad of malformed) {
-			writeFileSync(recordFile(DEAD_PID), JSON.stringify(bad));
+			writeFileSync(recordFile(LIVE_PID), JSON.stringify(bad));
+			// A relaxation mutant that accepts the record must see a live pid
+			// WITH its auth key, so the deletion can only come from field
+			// validation: plant the key for the malformed record's OWN
+			// socketPath when it still carries a string one.
+			const socketPath = (bad as { socketPath?: unknown } | null)?.socketPath;
+			if (typeof socketPath === "string") {
+				writeFileSync(join(peersDir, keyFileNameFor(LIVE_PID, socketPath)), "{}");
+			}
 			// Direct write bypasses publish(): ask for a real scan so this test
 			// asserts per-file self-healing, not scan-cache behavior.
 			registry.list({ fresh: true });
-			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(bad)}`).toBe(false);
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${JSON.stringify(bad)}`).toBe(false);
+		}
+		// JSON.stringify cannot carry Infinity, and a mistyped string ("soon")
+		// is both non-number and non-finite: the &&-relaxations of the combined
+		// typeof/Number.isFinite checks diverge from the original only on a
+		// NUMBER that is non-finite. Splice 1e999 into the raw text —
+		// JSON.parse yields Infinity, which must still be rejected.
+		for (const field of ["statusUpdatedAt", "startedAt"] as const) {
+			const raw = JSON.stringify({ ...makeRecord(LIVE_PID), [field]: 0 }).replace(`"${field}":0`, `"${field}":1e999`);
+			writeFileSync(recordFile(LIVE_PID), raw);
+			registry.list({ fresh: true });
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${field}: Infinity`).toBe(false);
 		}
 	});
 
 	it("deletes records with invalid kind/status/nameSource", () => {
 		freshRegistry();
+		assertValidRecordSurvivesScan();
+		// Invalid enum values are not expressible as Partial<PeerRecord>, so
+		// they are spliced over a valid base record (same as the original
+		// fixture shape) — the spread's makeRecord call plants the matching key.
 		for (const patch of [{ kind: "daemon" }, { status: "sleeping" }, { nameSource: "auto" }]) {
-			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			writeFileSync(recordFile(LIVE_PID), JSON.stringify({ ...makeRecord(LIVE_PID), ...patch }));
 			registry.list({ fresh: true });
-			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
 		}
 	});
 
 	it("deletes records whose name is not already normalized (control chars, case, whitespace)", () => {
 		freshRegistry();
+		assertValidRecordSurvivesScan();
 		// Legit publishers run names through normalizeName() before writing, so
 		// a raw name here is a foreign/corrupt writer. Control chars would render
 		// raw into /peers and tool output.
@@ -378,44 +443,57 @@ describe("list self-healing", () => {
 			{ name: " padded " },
 		];
 		for (const patch of patches) {
-			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			writeFileSync(recordFile(LIVE_PID), JSON.stringify(makeRecord(LIVE_PID, patch)));
 			registry.list({ fresh: true });
-			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
+			// A live pid keeps its record: deletion proves parsePeerRecord
+			// rejected the raw name itself (not a liveness sweep).
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
 		}
 	});
 
 	it("deletes records with an over-long name", () => {
 		freshRegistry();
-		const overLong = { ...makeRecord(DEAD_PID), name: "a".repeat(65) };
-		writeFileSync(recordFile(DEAD_PID), JSON.stringify(overLong));
+		// Control at the exact boundary: the longest VALID 64-char name must
+		// survive, pinning the maximum and proving the fixture pid is live.
+		assertValidRecordSurvivesScan({ name: "a".repeat(64) });
+		const overLong = { ...makeRecord(LIVE_PID), name: "a".repeat(65) };
+		writeFileSync(recordFile(LIVE_PID), JSON.stringify(overLong));
 		registry.list({ fresh: true });
-		expect(existsSync(recordFile(DEAD_PID))).toBe(false);
+		expect(existsSync(recordFile(LIVE_PID))).toBe(false);
 	});
 
 	it("deletes records with control characters in cwd, sessionId, or socketPath", () => {
 		freshRegistry();
+		assertValidRecordSurvivesScan();
 		const patches: Array<Partial<PeerRecord>> = [
 			{ cwd: "D:/bad\u0007path" },
 			{ sessionId: "sess\u001besc" },
 			{ socketPath: "sock\u007fnext" },
 		];
 		for (const patch of patches) {
-			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			// makeRecord(…, patch) plants the auth key for the PATCHED
+			// socketPath, so a validation-relaxing mutant cannot be rescued
+			// by the zombie-key sweep instead.
+			writeFileSync(recordFile(LIVE_PID), JSON.stringify(makeRecord(LIVE_PID, patch)));
 			registry.list({ fresh: true });
-			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${JSON.stringify(patch)}`).toBe(false);
 		}
 	});
 
 	it("deletes records with over-long cwd or sessionId", () => {
 		freshRegistry();
+		// Control at both exact boundaries (512-char cwd, 128-char sessionId):
+		// the longest VALID values must survive — pinning both maxima against
+		// off-by-one relaxations while proving the fixture pid is live.
+		assertValidRecordSurvivesScan({ cwd: `D:/${"x".repeat(509)}`, sessionId: "s".repeat(128) });
 		const patches: Array<Partial<PeerRecord>> = [
 			{ cwd: `D:/${"x".repeat(512)}` },
 			{ sessionId: "s".repeat(129) },
 		];
 		for (const patch of patches) {
-			writeFileSync(recordFile(DEAD_PID), JSON.stringify({ ...makeRecord(DEAD_PID), ...patch }));
+			writeFileSync(recordFile(LIVE_PID), JSON.stringify(makeRecord(LIVE_PID, patch)));
 			registry.list({ fresh: true });
-			expect(existsSync(recordFile(DEAD_PID)), `should delete ${JSON.stringify(patch).slice(0, 40)}`).toBe(false);
+			expect(existsSync(recordFile(LIVE_PID)), `should delete ${JSON.stringify(patch).slice(0, 40)}`).toBe(false);
 		}
 	});
 
