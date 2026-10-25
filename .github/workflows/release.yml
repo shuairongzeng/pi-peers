@@ -52,21 +52,6 @@ jobs:
       - name: Ensure npm >= 11.5.1 for trusted publishing
         run: npm install -g npm@latest
 
-      - name: Diagnose OIDC availability (temporary)
-        run: |
-          echo "GITHUB_ACTIONS=$GITHUB_ACTIONS"
-          echo "HAS_ID_TOKEN_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
-          echo "HAS_ID_TOKEN_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
-          npm --version
-
-      - name: Probe npm OIDC exchange (temporary)
-        run: |
-          OIDC=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=npm:registry.npmjs.org" | node -pe "JSON.parse(require('fs').readFileSync(0)).value")
-          PAYLOAD=$(echo "$OIDC" | cut -d. -f2 | tr '_-' '/+')
-          PAD=$(( (4 - ${#PAYLOAD} % 4) % 4 ))
-          echo "$PAYLOAD$(printf '=%.0s' $(seq 1 $PAD))" | base64 -d 2>/dev/null | node -pe "const c=JSON.parse(require('fs').readFileSync(0)); JSON.stringify({repository:c.repository, repository_owner:c.repository_owner, workflow_ref:c.workflow_ref, job_workflow_ref:c.job_workflow_ref, ref:c.ref, environment:c.environment??null, aud:c.aud}, null, 1)"
-          curl -s -X POST -H "Authorization: Bearer $OIDC" -H "Accept: application/json" "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/@zengcool%2fpi-peers" -w "\nHTTP_STATUS:%{http_code}\n" | sed -E 's/("token"\s*:\s*")[^"]+/\1<redacted>/'
-
       - name: Install dependencies
         run: npm ci
 
