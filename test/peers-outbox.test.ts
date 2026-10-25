@@ -675,5 +675,44 @@ describe("createPeerOutbox liveness self-heal", () => {
 		expect(invalidateAlive).not.toHaveBeenCalled();
 		expect(transport.connects).toEqual([]);
 	});
+
+	it("a connection_lost send (peer vanished mid-flush) invalidates its cached verdict", async () => {
+		// The fake conn's end() rejects like the real transport does when the
+		// flush fails: the connect succeeded, the writes were buffered, the
+		// peer vanished before draining them.
+		const transport = makeTransport({
+			connect: async () => {
+				const conn: FakeConn = {
+					lines: [],
+					ended: false,
+					destroyed: false,
+					writeLine(line: string) {
+						this.lines.push(line);
+					},
+					async end() {
+						throw new Error("write EOF");
+					},
+					destroy() {
+						this.destroyed = true;
+					},
+				};
+				transport.sessions.push(conn);
+				return conn;
+			},
+		});
+		const invalidateAlive = vi.fn();
+		const deps = makeDeps({
+			transport,
+			registry: makeRegistry(() => ({ kind: "unique", entry: entry() }), [], invalidateAlive),
+		});
+		const outbox = createPeerOutbox(deps);
+
+		await expect(outbox.send("alpha", "hi", {})).rejects.toMatchObject({ code: "connection_lost" });
+		// The failed connection was destroyed (no half-open socket leak)...
+		expect(transport.sessions[0]!.destroyed).toBe(true);
+		// ...and the stale live verdict dropped, same as connect_failed.
+		expect(invalidateAlive).toHaveBeenCalledTimes(1);
+		expect(invalidateAlive).toHaveBeenCalledWith(4242);
+	});
 });
 });

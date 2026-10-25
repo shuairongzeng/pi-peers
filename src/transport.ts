@@ -367,18 +367,45 @@ function createConnection(socket: Socket, queue: LineQueue | undefined, macosClo
 			if (process.platform === "darwin" && state.macosCloseDelayMs > 0) {
 				await new Promise<void>((resolve) => setTimeout(resolve, state.macosCloseDelayMs));
 			}
+			// Already torn down (peer died mid-send, or a guard path destroyed
+			// us): end() is the surfacing point — the caller must learn that
+			// whatever writeLine() buffered may never have reached the peer.
 			if (state.socket.destroyed) {
-				return;
+				throw new Error(`socket was destroyed before end(): buffered writes may not have been flushed`);
 			}
-			await new Promise<void>((resolve) => {
-				state.socket.end((error?: Error | null) => {
-					if (error) {
-						console.error(`[pi-peers] connection end failed: ${String(error)}`);
-					}
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			let settled = false;
+			const settle = (asError: boolean, error?: Error): void => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				if (asError) {
+					reject(new Error(`connection end failed: ${String(error)}`));
+				} else {
 					resolve();
-				});
-				state.socket.once("close", () => resolve());
+				}
+			};
+			// A close racing the flush callback: with an error (peer reset
+			// mid-flush) it rejects; without one it is the safety net that
+			// guarantees settlement even when the end callback never fires.
+			state.socket.once("close", (hadError: boolean) => {
+				if (hadError) {
+					settle(true, new Error("socket closed with an error before the flush completed"));
+				} else {
+					settle(false);
+				}
 			});
+			try {
+				state.socket.end((error?: Error | null) => {
+					settle(error !== undefined && error !== null, error ?? undefined);
+				});
+			} catch (error) {
+				// net.Socket.end() throws synchronously on an already-destroyed
+				// socket in some Node builds — surface it the same way.
+				settle(true, error instanceof Error ? error : new Error(String(error)));
+			}
+			await promise;
 		},
 		destroy() {
 			state.closing = true;

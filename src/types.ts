@@ -406,6 +406,7 @@ export type PeerSendErrorCode =
 	| "no_key" // key file missing: cannot authenticate
 	| "no_live_inbox" // registry/key missing AND endpoint unverifiable; refusing to send
 	| "connect_failed"
+	| "connection_lost" // peer accepted our connect, then vanished while frames were still flushing
 	| "timeout"
 	| "message_too_large"
 	| "sender_paced" // local pacing predicts the peer would drop us; merge and retry
@@ -503,7 +504,7 @@ export interface PeerSocketAddress {
 export interface PeerConnection {
 	/** Write one line (appends \n when the line lacks one; pre-framed input from serializeFrame/buildAuthLine is written verbatim). Rejects when the cumulative message would exceed the cap. */
 	writeLine(line: string): void;
-	/** End the outbound side after flushing (applies the macOS close delay). */
+	/** End the outbound side after flushing (applies the macOS close delay). Rejects when the flush fails — the peer vanished mid-send. */
 	end(): Promise<void>;
 	/** Destroy immediately. */
 	destroy(): void;

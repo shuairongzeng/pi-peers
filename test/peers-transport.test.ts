@@ -283,7 +283,8 @@ describe("transport round trip", () => {
 	it("carries an auth line and two frames end-to-end", async () => {
 		const token = hex32();
 		const { server, first } = await startServer((conn) => {
-			void conn.end();
+			// Benign end: a teardown-race rejection must not leak.
+			void conn.end().catch(() => {});
 		});
 
 		const client = await transport.connect(server.address.address);
@@ -435,7 +436,10 @@ describe("transport round trip", () => {
 				for await (const line of lines) {
 					conn.writeLine(`${line}${line}`);
 				}
-				await conn.end();
+				// Benign end: a teardown-race rejection (our listener close
+				// destroyed the socket mid-drain) must not leak as an
+				// unhandled rejection — the echo was best-effort.
+				await conn.end().catch(() => {});
 			})();
 		});
 
@@ -484,7 +488,9 @@ describe("transport round trip", () => {
 				for await (const line of lines) {
 					conn.writeLine(line);
 				}
-				await conn.end();
+				// Benign end: a teardown-race rejection must not leak as an
+				// unhandled rejection — the echo was best-effort.
+				await conn.end().catch(() => {});
 			})();
 		});
 
@@ -506,7 +512,7 @@ describe("transport round trip", () => {
 		expect(echoed[999]).toBe("l-999");
 	});
 
-	it("logs a console.error and still resolves when end()'s flush fails", async () => {
+	it("rejects when end()'s flush fails (peer vanished mid-send)", async () => {
 		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
 		try {
 			// Server-side connection that never drains: it accepts the auth
@@ -526,18 +532,38 @@ describe("transport round trip", () => {
 			client.writeLine(`x${"a".repeat(600 * 1024)}`);
 			const ending = client.end();
 			serverConn?.destroy();
-			// Best-effort semantics: end() resolves even when the flush failed.
-			await ending;
-
-			const logged = consoleError.mock.calls
-				.flat()
-				.map((part) => String(part))
-				.join("\n");
-			expect(logged).toContain("[pi-peers]");
-			expect(logged).toContain("end failed");
+			// The flush failed: end() must reject so the caller learns the
+			// bytes may never have arrived (the silent-loss contract).
+			await expect(ending).rejects.toThrow(/connection end failed/);
 		} finally {
 			consoleError.mockRestore();
 		}
+	});
+
+	it("end() rejects when the socket is already destroyed", async () => {
+		let serverConn: PeerConnection | undefined;
+		const { server, first } = await startServer((conn) => {
+			serverConn = conn;
+		});
+
+		const client = await transport.connect(server.address.address);
+		client.writeLine("auth");
+		// The connection must be accepted before the peer vanishes, or the
+		// destroy below would race the accept and the drain would hang.
+		await first;
+
+		// The peer vanishes while our big line is still buffered: the reset
+		// destroys our socket. readLines() ends exactly when that close
+		// lands, so end() is provably called on an already-destroyed socket.
+		client.writeLine(`x${"a".repeat(600 * 1024)}`);
+		serverConn?.destroy();
+		for await (const _echoed of transport.readLines(client)) {
+			// Nothing echoes back — the peer destroyed the connection.
+		}
+		await expect(client.end()).rejects.toThrow(/destroyed before end()/);
+		// Idempotence is preserved: a second end() on the closed connection
+		// returns without a fresh rejection (closing short-circuit).
+		await expect(client.end()).resolves.toBeUndefined();
 	});
 
 	it("readLines rejects connections from another transport factory", () => {
@@ -783,7 +809,8 @@ describe("listen/connect options", () => {
 	it("accepts the documented optional overrides", async () => {
 		const listenOptions: PeerListenOptions = { firstLineTimeoutMs: 1_000 };
 		const { server, first } = await startServer((conn) => {
-			void conn.end();
+			// Benign end: a teardown-race rejection must not leak.
+			void conn.end().catch(() => {});
 		}, listenOptions);
 
 		const connectOptions: PeerConnectOptions = { connectTimeoutMs: 3_000, macosCloseDelayMs: 1 };

@@ -564,12 +564,20 @@ describe("fault: real-transport peer failures", () => {
 
 		if (phaseA.typedError !== undefined) {
 			// Connect-phase fault: the typed-error family the contract promises.
-			expect(["connect_failed", "timeout", "offline"]).toContain(phaseA.typedError.code);
+			expect(["connect_failed", "timeout", "offline", "connection_lost"]).toContain(phaseA.typedError.code);
+			// A mid-flush vanish is connection_lost by contract: the connect
+			// succeeded, the flush failed — the caller must be told delivery
+			// is uncertain (this is the silent-loss hole this suite pins).
+			if (phaseA.typedError.code === "connection_lost") {
+				expect(phaseA.typedError.message).toContain("disappeared mid-send");
+				expect(phaseA.typedError.message).toContain(vanisher.address.path);
+			}
 			expect(phaseA.outcome).toBeUndefined();
 		} else {
-			// Post-auth vanish: the write was buffered and the send resolved.
-			// The designed failure signal is the receipt that never arrives
-			// (receipts are the delivery contract) plus the module-owned log.
+			// Post-auth vanish where the flush happened to complete: the send
+			// resolved. The designed failure signal is the receipt that never
+			// arrives (receipts are the delivery contract) plus the module-
+			// owned log.
 			expect(phaseA.outcome).toBeDefined();
 			// Absence can only be sampled over time: local-IPC receipts arrive
 			// within milliseconds of delivery, so a 300ms window is a generous
@@ -597,7 +605,7 @@ describe("fault: real-transport peer failures", () => {
 		expect(phaseB.typedError, "a fully-vanished endpoint must reject with a typed PeerSendError").toBeInstanceOf(
 			PeerSendError,
 		);
-		expect(["connect_failed", "timeout", "offline"]).toContain(phaseB.typedError!.code);
+		expect(["connect_failed", "timeout", "offline", "connection_lost"]).toContain(phaseB.typedError!.code);
 		// Zero unhandledRejections during the whole scenario: asserted by the
 		// file-level afterEach, exactly the "host never crashes" contract.
 	});

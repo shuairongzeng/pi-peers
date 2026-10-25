@@ -198,19 +198,35 @@ export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 	 */
 	async function deliver(address: string, socketPath: string, token: string, lines: string[]): Promise<void> {
 		let conn: PeerConnection | undefined;
+		// Connect + write phase: the endpoint never accepted us, or the
+		// writes themselves failed. Either way nothing was mid-flight.
 		try {
 			conn = await transport.connect(address);
 			conn.writeLine(protocol.buildAuthLine(token));
 			for (const line of lines) {
 				conn.writeLine(line);
 			}
-			await conn.end();
 		} catch (error) {
 			conn?.destroy();
 			if (error instanceof PeerSendError) {
 				throw error;
 			}
 			throw new PeerSendError("connect_failed", `failed delivering peer message to ${socketPath}: ${String(error)}`);
+		}
+		// Flush phase: the connect succeeded and every line was buffered, but
+		// the peer vanished before they drained. end() is the surfacing point
+		// (writeLine stays silent once closing — it cannot report this), so a
+		// rejection here means delivery itself failed: the bytes may never
+		// have arrived. That is a different failure from never connecting,
+		// and it gets its own code so callers can tell them apart.
+		try {
+			await conn.end();
+		} catch (error) {
+			conn.destroy();
+			if (error instanceof PeerSendError) {
+				throw error;
+			}
+			throw new PeerSendError("connection_lost", `peer at ${socketPath} disappeared mid-send: ${String(error)}`);
 		}
 	}
 
@@ -310,13 +326,14 @@ export function createPeerOutbox(deps: PeerOutboxDeps): PeerOutbox {
 			// believed alive means it likely died after its verdict was cached
 			// (the alive cache can hold a stale live:true for up to its TTL).
 			// Drop that verdict so the next resolve/list() re-probes and the
-			// user gets "offline" instead of another connect_failed. Only the
-			// connect-phase codes qualify: message_too_large etc. say nothing
-			// about liveness.
+			// user gets "offline" instead of another connect_failed. A
+			// connection_lost (the peer accepted our connect, then vanished
+			// mid-flush) is the same evidence of death — only these liveness-
+			// bearing codes qualify: message_too_large etc. say nothing about it.
 			if (
 				entry.live &&
 				error instanceof PeerSendError &&
-				(error.code === "connect_failed" || error.code === "timeout")
+				(error.code === "connect_failed" || error.code === "timeout" || error.code === "connection_lost")
 			) {
 				registry.invalidateAlive(record.pid);
 			}

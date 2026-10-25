@@ -219,6 +219,11 @@ function describeSendError(
 		case "protocol_version":
 			// Already actionable end to end (cause + remedy in the message).
 			return error.message;
+		case "connection_lost":
+			// The outbox names the peer and the failure; add the retry
+			// guidance it cannot know the user needs (wait for re-register,
+			// then resend — the peer may have received nothing).
+			return `${error.message} Retry once the peer re-registers (check with action: "list").`;
 		case "invalid_target":
 			// Cross-project refusals come from findCrossProjectTarget, whose
 			// message names the other project. types.ts is frozen (no structured
