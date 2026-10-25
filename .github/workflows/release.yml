@@ -52,6 +52,13 @@ jobs:
       - name: Ensure npm >= 11.5.1 for trusted publishing
         run: npm install -g npm@latest
 
+      - name: Diagnose OIDC availability (temporary)
+        run: |
+          echo "GITHUB_ACTIONS=$GITHUB_ACTIONS"
+          echo "HAS_ID_TOKEN_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          echo "HAS_ID_TOKEN_TOKEN=${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          npm --version
+
       - name: Install dependencies
         run: npm ci
 
