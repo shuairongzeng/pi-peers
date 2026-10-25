@@ -1,0 +1,72 @@
+# Release workflow for @zengcool/pi-peers.
+#
+# Publishes to the npm registry via npm Trusted Publishing (OIDC): no npm token
+# is stored, passed, or written anywhere in this workflow. npm authenticates the
+# publish from this job's GitHub Actions OIDC identity, so the npm-side Trusted
+# Publisher configuration MUST reference this exact workflow:
+#   owner: shuairongzeng, repository: pi-peers,
+#   workflow filename: release.yml, environment: (none)
+#
+# Runs on pushes of v* tags (e.g. v0.1.1) and on manual workflow_dispatch.
+# Manual runs execute the full install/typecheck/test gate but skip publishing,
+# since a publish only makes sense for a tag.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# id-token: write lets the job mint the OIDC token npm verifies (also required
+# for --provenance); contents: read covers the checkout. Nothing else is needed.
+permissions:
+  id-token: write
+  contents: read
+
+# Serialize runs per ref so a duplicate push of the same tag cannot race an
+# in-flight publish. cancel-in-progress stays false: a queued re-run is safe,
+# killing a publish mid-flight is not.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # Deliberately no registry configuration and no auth token: trusted
+      # publishing authenticates via OIDC; registry auth config would write a
+      # placeholder-token .npmrc that breaks it.
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Trusted publishing requires npm CLI >= 11.5.1; the runner's bundled npm
+      # may be older, so upgrade it globally before any npm command.
+      - name: Ensure npm >= 11.5.1 for trusted publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Fail the run before publishing when the tag and package.json disagree,
+      # so a tagged commit can never ship a manifest with a different version.
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: "node -e \"const v = require('./package.json').version; const tag = process.env.GITHUB_REF.slice('refs/tags/v'.length); if (v !== tag) { console.error('Tag mismatch: v' + tag + ' vs package.json ' + v); process.exit(1); } console.log('Tag v' + tag + ' matches package.json version ' + v);\""
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm via trusted publishing (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        run: npm publish --provenance --access public
