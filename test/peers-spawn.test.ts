@@ -5,12 +5,12 @@
 
 import { type ChildProcess, spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createPeerRegistry } from "../src/registry.ts";
-import { createPeerSpawner, hostCommand, type PeerExec, type SpawnedProcess } from "../src/spawn.ts";
+import { assertValidModelArg, createPeerSpawner, hostCommand, type PeerExec, type SpawnedProcess } from "../src/spawn.ts";
 import { ENV_PEERS_DIR, ENV_PEERS_EPHEMERAL, ENV_PEERS_NAME, PeerSendError, PeerSpawnError, type PeerRecord } from "../src/types.ts";
 
 let peersDir: string;
@@ -22,7 +22,9 @@ beforeEach(() => {
 
 afterEach(() => {
 	delete process.env[ENV_PEERS_DIR];
-	rmSync(peersDir, { recursive: true, force: true });
+	// Windows: a real `cmd /c start` child (visible-spawn tests) holds the dir
+	// briefly after exit; retry instead of flaking on EPERM.
+	rmSync(peersDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function fakeRecord(name: string, pid: number, overrides?: Partial<PeerRecord>): PeerRecord {
@@ -66,6 +68,33 @@ function fakeExec(captured: { env?: NodeJS.ProcessEnv; headless?: boolean }): Pe
 		captured.headless = options.headless;
 		plantRecordWithKey(fakeRecord(options.env[ENV_PEERS_NAME] ?? "unset", process.pid));
 		return { pid: process.pid, kill: () => {}, onError: () => {} };
+	};
+}
+/**
+ * Await a condition: retries a predicate until it holds or the 5s budget
+ * runs out (each miss defers to the event loop's own turn via a short
+ * timer, so the wait ends the moment the condition flips — no fixed sleep
+ * masking the awaited event; the budget bounds a broken condition instead).
+ */
+async function waitFor(predicate: () => boolean, budgetMs = 5_000): Promise<void> {
+	const deadline = Date.now() + budgetMs;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("timed out waiting for condition");
+		await new Promise<void>((resolve) => setTimeout(resolve, 10));
+	}
+}
+
+/** Await a file's appearance and return its contents (see waitFor). */
+async function waitForFile(path: string, budgetMs = 5_000): Promise<string> {
+	await waitFor(() => existsSync(path), budgetMs);
+	return readFileSync(path, "utf8");
+}
+
+/** Exec that records its args and registers instantly (same fake as fakeExec). */
+function fakeExecWithArgs(captured: { env?: NodeJS.ProcessEnv; headless?: boolean; args?: string[] }): PeerExec {
+	return (_command, args, options) => {
+		captured.args = args;
+		return fakeExec(captured)(_command, args, options);
 	};
 }
 
@@ -587,5 +616,214 @@ describe("createPeerSpawner", () => {
 		expect(message).toContain("check the spawned window for a trust dialog or startup error");
 		// The headless-only guidance must not leak into the visible variant.
 		expect(message).not.toContain("stderr");
+	});
+
+	// -- model arg -----------------------------------------------------------
+
+	it("model given: exec args carry --model followed by the value", async () => {
+		const captured: { args?: string[] } = {};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			exec: fakeExecWithArgs(captured),
+		});
+		const outcome = await spawner({ name: "model-worker", model: "aliyun/kimi-k3" });
+		expect(outcome.name).toBe("model-worker");
+		// Adjacency, not just membership: --model must be immediately followed
+		// by its value (a standalone "--model" assertion would pass even if the
+		// value landed elsewhere or never).
+		const idx = captured.args?.indexOf("--model");
+		expect(idx).toBeDefined();
+		expect(captured.args?.[idx! + 1]).toBe("aliyun/kimi-k3");
+	});
+
+	it("no model given: exec args contain no --model", async () => {
+		const captured: { args?: string[] } = {};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			exec: fakeExecWithArgs(captured),
+		});
+		await spawner({ name: "default-model-worker" });
+		expect(captured.args?.includes("--model")).toBe(false);
+	});
+
+	it("trims surrounding whitespace off the model value", async () => {
+		const captured: { args?: string[] } = {};
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			exec: fakeExecWithArgs(captured),
+		});
+		await spawner({ name: "trim-worker", model: "  k3  " });
+		const idx = captured.args?.indexOf("--model");
+		expect(captured.args?.[idx! + 1]).toBe("k3");
+	});
+
+	it("invalid models are rejected before any exec call", async () => {
+		// Each of these must fail the pre-spawn validation: a leading '-' would
+		// turn the value into an arbitrary CLI flag on the child host, empty /
+		// whitespace-only and spaced values are meaningless ids, and >200 chars
+		// is abuse of a fuzzy-match pattern.
+		for (const model of ["-x", "", "  ", "a b", "--dangerously-skip-permissions", "a".repeat(201)]) {
+			let execCalls = 0;
+			const exec: PeerExec = () => {
+				execCalls += 1;
+				return { pid: 1, kill: () => {}, onError: () => {} };
+			};
+			const registry = createPeerRegistry(peersDir);
+			const spawner = createPeerSpawner({ registry, outbox: fakeOutbox([]), cwd: () => peersDir, exec });
+			await expect(spawner({ name: "bad-model", model })).rejects.toMatchObject({
+				name: "PeerSpawnError",
+				kind: "spawn_failed",
+			});
+			// Validation happens BEFORE spawn: no child may ever be launched with
+			// a crafted value.
+			expect(execCalls).toBe(0);
+			// The rejection names the rejected value so the caller can fix it.
+			await expect(spawner({ name: "bad-model", model })).rejects.toThrow(/invalid model/);
+		}
+	});
+
+	it("valid model edge cases pass validation", () => {
+		// Bare fuzzy names, provider-qualified ids, and thinking-suffixed ids.
+		expect(assertValidModelArg("k3")).toBe("k3");
+		expect(assertValidModelArg("aliyun/kimi-k3")).toBe("aliyun/kimi-k3");
+		expect(assertValidModelArg("zai-org/GLM-5.1-FP8:high")).toBe("zai-org/GLM-5.1-FP8:high");
+		expect(assertValidModelArg("gpt-5.2")).toBe("gpt-5.2");
+		// 200 chars is still inside the limit.
+		expect(assertValidModelArg("a".repeat(200))).toBe("a".repeat(200));
+	});
+
+	it("child that exits before registering rejects fast with its stderr tail", async () => {
+		// An invalid --model makes the real host print a diagnostic to stderr
+		// and exit(1) before rpc mode starts. The spawner must surface that
+		// immediately — not after the 30s register timeout.
+		const stderr = 'Model "bogus" not found. Use --list-models to see available models.';
+		const exec: PeerExec = () => ({
+			pid: 4321,
+			kill: () => {},
+			onError: () => {},
+			// Fire the exit synchronously at spawn time: the loop's first
+			// iteration must observe it.
+			onExit: (cb) => cb(1),
+			stderrTail: () => stderr,
+		});
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 30_000,
+			exec,
+		});
+		const startedAt = Date.now();
+		const error = await spawner({ name: "model-reject", headless: true, model: "bogus" }).then(
+			() => {
+				throw new Error("expected spawn_failed");
+			},
+			(e: unknown) => e,
+		);
+		expect(error).toBeInstanceOf(PeerSpawnError);
+		expect(error).toMatchObject({ kind: "spawn_failed" });
+		const message = (error as PeerSpawnError).message;
+		expect(message).toContain('spawned "model-reject" but it exited (code 1) before registering');
+		expect(message).toContain(stderr);
+		expect(message).toContain("the child host rejected its startup arguments");
+		// FAST: far under the 30s register timeout a dead child would otherwise
+		// burn. Generous margin keeps the assertion robust on slow CI.
+		expect(Date.now() - startedAt).toBeLessThan(5_000);
+	});
+
+	it("child that stays alive but never registers still times out", async () => {
+		// onExit never fires: the historic register_timeout path must stay
+		// intact for alive-but-stalled children.
+		const exec: PeerExec = () => ({
+			pid: 5555,
+			kill: () => {},
+			onError: () => {},
+			onExit: () => {},
+			stderrTail: () => "",
+		});
+		const registry = createPeerRegistry(peersDir);
+		const spawner = createPeerSpawner({
+			registry,
+			outbox: fakeOutbox([]),
+			cwd: () => peersDir,
+			registerTimeoutMs: 300,
+			exec,
+		});
+		await expect(spawner({ name: "stalled", headless: true })).rejects.toMatchObject({
+			kind: "register_timeout",
+		});
+	});
+
+	it("visible spawn with model: cmd start args include the --model value", async () => {
+		// defaultExec's visible branch runs `cmd /c start "" <command> --model k3`
+		// where <command> comes from hostCommand(process.argv, …). No real host
+		// session is launched: patch process.argv so the "host" is a node stub
+		// that records its own argv and exits — the spawner then times out
+		// waiting for a record that never appears. (The brief `start` window is
+		// the same one every visible spawn opens; on headless CI none appears.)
+		const realPlatform = process.platform;
+		const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") ?? {
+			enumerable: true,
+			configurable: true,
+			value: realPlatform,
+		};
+		const realArgv = process.argv;
+		const argvDescriptor = Object.getOwnPropertyDescriptor(process, "argv") ?? {
+			enumerable: true,
+			configurable: true,
+			value: realArgv,
+		};
+		// Stub files and the child's cwd live OUTSIDE peersDir: a real
+		// `cmd /c start` child pins its cwd, and Windows refuses to delete a
+		// directory that is a live (or just-exited) process's cwd — mixing the
+		// two flaked the afterEach rm with EPERM.
+		const stubDir = mkdtempSync(join(tmpdir(), "pi-peers-stub-"));
+		const argvFile = join(stubDir, "cmdstub-argv.txt");
+		const stub = join(stubDir, "cmdstub.cjs");
+		writeFileSync(
+			stub,
+			// chdir FIRST: a spawned process pins its cwd, and Windows refuses to
+			// delete a pinned directory. Leaving stubDir immediately makes the
+			// finally-cleanup independent of when the start-chain fully exits.
+			`process.chdir(${JSON.stringify(tmpdir())}); ` +
+				"require('node:fs').writeFileSync(__dirname + '/cmdstub-argv.txt', process.argv.slice(2).join('\\n')); setImmediate(() => process.exit(0));",
+		);
+		// hostCommand: argv[1] (the stub, a .cjs) becomes the child script, so
+		// `start` launches: node <stub.cjs> --model k3 [--mode rpc is headless-only].
+		Object.defineProperty(process, "argv", { ...argvDescriptor, value: [process.execPath, stub] });
+		Object.defineProperty(process, "platform", { ...platformDescriptor, value: "win32" });
+		try {
+			const registry = createPeerRegistry(peersDir);
+			const spawner = createPeerSpawner({
+				registry,
+				outbox: fakeOutbox([]),
+				cwd: () => stubDir,
+				registerTimeoutMs: 300,
+			});
+			await expect(spawner({ name: "visible-model", model: "k3" })).rejects.toMatchObject({
+				kind: "register_timeout",
+			});
+			// The started host's own argv must carry the model as an adjacent
+			// --model <value> pair. The stub may still be racing the 300ms
+			// deadline: await its output deterministically instead of assuming.
+			const startArgs = (await waitForFile(argvFile)).split("\n");
+			const idx = startArgs.indexOf("--model");
+			expect(idx).toBeGreaterThanOrEqual(0);
+			expect(startArgs[idx + 1]).toBe("k3");
+		} finally {
+			Object.defineProperty(process, "argv", { ...argvDescriptor, value: realArgv });
+			Object.defineProperty(process, "platform", { ...platformDescriptor, value: realPlatform });
+			rmSync(stubDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+		}
 	});
 });

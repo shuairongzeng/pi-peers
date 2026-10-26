@@ -157,6 +157,15 @@ describe("peers plugin wiring (dual-host)", () => {
 		expect(tools.map((t) => t.name)).toContain("send_peer_message");
 		expect(commands.has("peers")).toBe(true);
 
+		// The spawn_peer tool schema exposes the model picker (schema shape,
+		// matching how the registered tool carries its parameters).
+		const spawnTool = tools.find((t) => t.name === "spawn_peer") as
+			| { parameters?: { properties?: Record<string, { description?: string }> } }
+			| undefined;
+		expect(spawnTool).toBeDefined();
+		expect(Object.keys(spawnTool?.parameters?.properties ?? {})).toContain("model");
+		expect(spawnTool?.parameters?.properties?.model?.description).toContain("--model");
+
 		// Plant a stale record + key from a dead pid; startup must sweep them.
 		mkdirSync(peersDir, { recursive: true });
 		writeFileSync(

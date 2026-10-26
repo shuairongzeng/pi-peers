@@ -10,8 +10,10 @@
  * real child pid behind the intermediate shell.
  *
  * Headless children run `--mode rpc` with stdin held open (closing it would
- * end the session) and stdio otherwise ignored. Visible children get their
- * own terminal window so the user can watch or intervene.
+ * end the session), stdout ignored and stderr captured to a rolling tail —
+ * a child that dies before registering (e.g. an invalid `--model`) fails
+ * fast with that tail instead of a registration timeout. Visible children
+ * get their own terminal window so the user can watch or intervene.
  */
 
 import { spawn as nodeSpawn } from "node:child_process";
@@ -34,6 +36,18 @@ export interface SpawnedProcess {
 	pid: number | undefined;
 	kill(): void;
 	onError(cb: (err: Error) => void): void;
+	/**
+	 * Subscribe to the child's exit (code null when killed by a signal).
+	 * Optional: fake launchers in tests may omit it, in which case a child
+	 * that dies before registering is diagnosed at the register timeout
+	 * (the historic path) instead of fail-fast.
+	 */
+	onExit?(cb: (code: number | null) => void): void;
+	/**
+	 * Last few KB of the child's captured stderr ("" when nothing was
+	 * captured — visible-window spawns and stderr-less launchers).
+	 */
+	stderrTail?(): string;
 }
 
 /** Injectable process launcher — tests substitute a fake or a node stub. */
@@ -77,11 +91,30 @@ const defaultExec: PeerExec = (command, args, options) => {
 			cwd: options.cwd,
 			env: options.env,
 			detached: true,
-			stdio: ["pipe", "ignore", "ignore"],
+			// stdout stays ignored: the child's rpc protocol stream must never
+			// sit in an unread pipe. stderr is captured (below) so a startup
+			// failure (e.g. an invalid --model) can be surfaced in the spawn
+			// error instead of dying with a 30s registration timeout.
+			stdio: ["pipe", "ignore", "pipe"],
 		});
 		// The child's rpc session lives as long as stdin stays open; hold it.
 		child.stdin?.on("error", () => {});
-		return { pid: child.pid, kill: () => child.kill(), onError: (cb) => child.once("error", cb) };
+		// Rolling tail of the child's stderr, capped so a chatty child cannot
+		// grow memory without bound — only the last few KB ever matter for
+		// diagnosing a startup failure.
+		const STDERR_TAIL_LIMIT = 8 * 1024;
+		let stderrTailText = "";
+		child.stderr?.on("data", (chunk: Buffer) => {
+			stderrTailText = (stderrTailText + chunk.toString("utf8")).slice(-STDERR_TAIL_LIMIT);
+		});
+		child.stderr?.on("error", () => {});
+		return {
+			pid: child.pid,
+			kill: () => child.kill(),
+			onError: (cb) => child.once("error", cb),
+			onExit: (cb) => child.once("exit", (code) => cb(code)),
+			stderrTail: () => stderrTailText,
+		};
 	}
 	// Visible terminal window. `start ""` owns the console; the returned pid is
 	// the intermediate shell's and unused — the registry name is the handle.
@@ -163,6 +196,29 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 }
 
 /**
+ * Validate a caller-supplied --model value before it reaches the child host's
+ * CLI. The value is model-facing (it comes from a tool schema), so anything
+ * that could re-shape the child's command line must be rejected up front: a
+ * leading '-' would let a crafted value become an arbitrary CLI flag, and
+ * whitespace/shell metacharacters have no business in a model id. Accepted:
+ * provider-qualified ids ("aliyun/kimi-k3"), thinking-suffixed ids
+ * ("zai-org/GLM-5.1-FP8:high") and bare short names ("k3").
+ */
+const MODEL_ARG_RE = /^[A-Za-z0-9][A-Za-z0-9._\/@:+~-]*$/;
+
+export function assertValidModelArg(model: string): string {
+	const trimmed = model.trim();
+	let reason: string | undefined;
+	if (trimmed === "") reason = "empty or whitespace-only";
+	else if (trimmed.length > 200) reason = "longer than 200 characters";
+	else if (!MODEL_ARG_RE.test(trimmed)) reason = "must be alphanumeric first, then [A-Za-z0-9._/:@:+~-] only (no leading '-', whitespace, or shell metacharacters)";
+	if (reason !== undefined) {
+		throw new PeerSpawnError("spawn_failed", `invalid model "${model}": ${reason}`);
+	}
+	return trimmed;
+}
+
+/**
  * Registration-timeout diagnostics: whether the child is still alive (a bare
  * kill(pid, 0) probe, checked here rather than in the registry so spawn keeps
  * only its types.ts deps) plus one actionable next step. A dead child usually
@@ -198,8 +254,13 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 	const timeoutMs = deps.registerTimeoutMs ?? 30_000;
 
 	return async (opts: PeerSpawnOptions): Promise<PeerSpawnOutcome> => {
+		// The model arg is model-facing CLI input: validate it BEFORE anything
+		// else (name assignment, child spawn) so a crafted value can never
+		// reach the child host's command line.
+		const model = opts.model !== undefined ? assertValidModelArg(opts.model) : undefined;
 		const name = pickUniqueName(deps.registry, opts.name);
-		const [command, ...args] = hostCommand(process.argv, process.execPath, process.execArgv);
+		const [command, ...baseArgs] = hostCommand(process.argv, process.execPath, process.execArgv);
+		const args = model !== undefined ? [...baseArgs, "--model", model] : baseArgs;
 		const env = buildChildEnv(opts, name);
 		const cwd = deps.cwd();
 		const spawnedAt = Date.now();
@@ -213,6 +274,13 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 		const child = exec(command, args, { cwd, env, headless: opts.headless === true });
 		child.onError((err) => {
 			spawnError = err;
+		});
+		// Track the child's exit (optional member: launchers without it keep
+		// the historic timeout-only diagnosis). undefined = not exited yet or
+		// not observable.
+		let exitCode: number | null | undefined;
+		child.onExit?.((code) => {
+			exitCode = code;
 		});
 
 		// Wait for the child's plugin to publish its registry record. Match on
@@ -238,6 +306,7 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 			if (spawnError !== undefined) {
 				throw new PeerSpawnError("spawn_failed", `failed to launch: ${spawnError.message}`);
 			}
+
 			if (headless && child.pid !== undefined) {
 				// Direct child: poll just its record by pid. O(1) file read — no
 				// directory scan, no self-healing side effects, no scan cache.
@@ -259,6 +328,25 @@ export function createPeerSpawner(deps: PeerSpawnerDeps): PeerSpawner {
 				entry = deps.registry
 					.list({ fresh: true })
 					.find((c) => c.record.name === normalizedName && c.record.startedAt >= graceFloor);
+			}
+			// Fail fast on a dead headless child: a child that exits before
+			// publishing its record will never publish it (an invalid --model
+			// makes the host print its diagnostic and exit(1) before rpc mode
+			// starts). Waiting out the full register timeout would only hide
+			// the real cause, so surface the exit plus the captured stderr
+			// tail right away; alive-but-stalled children keep the timeout path.
+			// Checked AFTER the record poll: a registration raced against an
+			// exit must still win.
+			if (headless && exitCode !== undefined && entry === undefined) {
+				const tail = child.stderrTail?.() ?? "";
+				const tailNote =
+					tail.trim() !== ""
+						? `: ${tail.trim().slice(-300)} — the child host rejected its startup arguments`
+						: " — the child host rejected its startup arguments";
+				throw new PeerSpawnError(
+					"spawn_failed",
+					`spawned "${name}" but it exited (code ${exitCode}) before registering${tailNote}`,
+				);
 			}
 			if (entry !== undefined) break;
 			await sleep(300, deps.signal);

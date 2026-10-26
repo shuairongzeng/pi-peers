@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-10-26
+
+### Added
+
+- **`spawn_peer` `model` parameter**: pick the spawned worker's model (e.g. a cheap
+  model for grunt work). Passed to the host CLI as `--model`; fuzzy patterns work
+  (`"k3"`, `"aliyun/kimi-k3"`, thinking suffix `"model:high"`). Values are validated
+  against a whitelist before spawn — a leading `-` is rejected so a crafted value can
+  never become an arbitrary CLI flag on the child host. Omitting `model` keeps the
+  host's configured default.
+
+### Fixed
+
+- **Fast failure for doomed spawns**: a headless child that exits before registering
+  (e.g. an invalid `model`, which makes the host exit 1 immediately) previously surfaced
+  only as a 30-second registration timeout with no cause. The spawner now captures the
+  child's stderr tail, watches for early exit, and fails within milliseconds with
+  `spawn_failed` plus the host's own error text. Verified against both hosts: pi and
+  omp exit 1 with `Model "<x>" not found` on stderr for unknown models.
+
 ## [0.1.1] - 2026-10-25
 
 ### Fixed

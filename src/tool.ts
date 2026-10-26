@@ -538,6 +538,14 @@ export const peerSpawnSchema = Type.Object({
 				"Use with task for one-shot jobs; omit when follow-up questions are expected.",
 		}),
 	),
+	model: Type.Optional(
+		Type.String({
+			description:
+				'Model for the new session, passed as --model to the host CLI. Fuzzy match OK (e.g. "k3" or "aliyun/kimi-k3"). ' +
+				"An invalid model fails fast with the host's own error instead of a registration timeout. " +
+				"Default: the host's configured default model.",
+		}),
+	),
 });
 
 export type PeerSpawnInput = Static<typeof peerSpawnSchema>;
@@ -550,6 +558,7 @@ Launches a new pi instance that immediately registers as a peer. Use this to run
 - Its replies arrive as \`<cross-session-message from="ADDRESS" from-name="X" …>\` user messages in your context, like any peer's.
 - Use \`task\` + \`ephemeral\` for one-shot jobs: the peer gets the task up front and exits by itself once it has done its work and reported back.
 - Omit \`ephemeral\` when follow-up questions are expected — an ephemeral peer cannot be asked anything after it exits.
+- \`model\` picks the new session's model via the host CLI's --model (fuzzy match OK, e.g. "k3" or "aliyun/kimi-k3"); default is the host's configured default model. An invalid model fails fast with the host's own error instead of a registration timeout.
 - \`headless\` runs it in the background without a visible terminal window; leave it false when the user may want to watch or interact with the new session.
 - The spawn waits for the new session to register (its record appears in the peer list). A failure here means the session did not start or did not register — nothing was lost, retry.
 - If the result says "Task NOT delivered", the peer is online and addressable by name; send the task with send_peer_message.
@@ -567,6 +576,7 @@ export function createPeerSpawnTool(deps: PeerToolDeps): PeersToolDefinition<Pee
 				task: params.task,
 				headless: params.headless,
 				ephemeral: params.ephemeral,
+				model: params.model,
 			};
 			try {
 				const outcome = await deps.spawner(options);

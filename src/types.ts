@@ -749,6 +749,12 @@ export interface PeerSpawnOptions {
 	headless?: boolean;
 	/** Exit automatically on the first idle after doing work. Default false. */
 	ephemeral?: boolean;
+	/**
+	 * CLI --model value passed to the spawned host (fuzzy match OK, e.g.
+	 * "k3" or "aliyun/kimi-k3"). An invalid model fails fast: the child host
+	 * exits before registering and the spawn error surfaces its stderr.
+	 */
+	model?: string;
 }
 
 export interface PeerSpawnOutcome {
