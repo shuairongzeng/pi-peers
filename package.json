@@ -1,6 +1,6 @@
 {
   "name": "@zengcool/pi-peers",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Cross-session messaging between pi-compatible coding agent instances on one machine (registry + named pipe/UDS + token auth + receipts). Works as an extension on pi and oh-my-pi.",
   "type": "module",
   "license": "MIT",
