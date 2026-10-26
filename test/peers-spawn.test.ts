@@ -764,7 +764,11 @@ describe("createPeerSpawner", () => {
 		});
 	});
 
-	it("visible spawn with model: cmd start args include the --model value", async () => {
+	// Windows-only: the visible branch runs `cmd.exe /c start`, which does not
+	// exist on POSIX (the POSIX guard has its own test above). Patching
+	// process.platform on Linux would spawn a missing binary and hang waiting
+	// for stub output that never appears.
+	it.skipIf(process.platform !== "win32")("visible spawn with model: cmd start args include the --model value", async () => {
 		// defaultExec's visible branch runs `cmd /c start "" <command> --model k3`
 		// where <command> comes from hostCommand(process.argv, …). No real host
 		// session is launched: patch process.argv so the "host" is a node stub
